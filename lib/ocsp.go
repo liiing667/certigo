@@ -23,26 +23,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"time"
 
-	"github.com/fatih/color"
 	"golang.org/x/crypto/ocsp"
 )
 
 var (
 	errSkippedRevocationCheck = errors.New("skipped revocation check")
-
-	revocationStatusColor = map[int]*color.Color{
-		ocsp.Good:    green,
-		ocsp.Revoked: red,
-		ocsp.Unknown: yellow,
-	}
-
-	revocationStatusDescription = map[int]string{
-		ocsp.Good:    "Good",
-		ocsp.Revoked: "Revoked",
-		ocsp.Unknown: "Unknown",
-	}
 
 	revocationReasonDescription = map[int]string{
 		ocsp.Unspecified:          "Unspecified",
@@ -75,13 +63,14 @@ func checkOCSP(chain []*x509.Certificate, ocspStaple []byte) (status *ocsp.Respo
 	}
 
 	leaf, issuer := chain[0], chain[1]
-	if len(leaf.OCSPServer) == 0 {
+	if len(leaf.OCSPServer) == 0 && len(ocspStaple) == 0 {
 		return nil, errSkippedRevocationCheck
 	}
 
 	retries := maxOCSPValidationRetries
-	if len(ocspStaple) > 0 {
-		// Don't retry if stapled
+	stapled := len(ocspStaple) > 0
+	if stapled {
+		// Don't retry if stapled, we'd just get the same bytes every time.
 		retries = 1
 	}
 
@@ -90,17 +79,64 @@ func checkOCSP(chain []*x509.Certificate, ocspStaple []byte) (status *ocsp.Respo
 		if len(encoded) == 0 {
 			encoded, err = fetchOCSP(leaf, issuer)
 			if err != nil {
-				return nil, err
+				// Network failures are retried, but never silently dropped:
+				// if we run out of retries, the error is returned to the caller.
+				err = fmt.Errorf("failed to fetch OCSP response: %w", err)
+				continue
 			}
 		}
 
-		status, err = ocsp.ParseResponse(encoded, issuer)
-		if err == nil {
-			break
+		status, err = ocsp.ParseResponseForCert(encoded, leaf, issuer)
+		if err != nil {
+			continue
 		}
+
+		// The response must be signed by the issuer, or by a delegated
+		// responder authorized by the issuer. Never trust an unsigned or
+		// badly-signed response.
+		if err = verifyOCSPResponseSignature(status, issuer); err != nil {
+			return nil, err
+		}
+
+		return status, nil
 	}
 
-	return status, err
+	return nil, err
+}
+
+// verifyOCSPResponseSignature checks the signature on an OCSP response and, if
+// the response was produced by a delegated responder, that the delegation from
+// the issuer is valid (per RFC 6960, section 4.2.2.2).
+func verifyOCSPResponseSignature(resp *ocsp.Response, issuer *x509.Certificate) error {
+	responder := resp.Certificate
+	if responder == nil {
+		// Response signed directly by the issuing CA.
+		if err := resp.CheckSignatureFrom(issuer); err != nil {
+			return fmt.Errorf("bad signature on OCSP response: %w", err)
+		}
+		return nil
+	}
+
+	// Delegated responder: its certificate must be issued by the same CA that
+	// issued the certificate being checked.
+	if err := issuer.CheckSignature(responder.SignatureAlgorithm, responder.RawTBSCertificate, responder.Signature); err != nil {
+		return fmt.Errorf("delegated OCSP responder certificate not issued by %q: %w", PrintCommonName(issuer.Subject), err)
+	}
+
+	// ... and it must be explicitly authorized to sign OCSP responses.
+	if !slices.Contains(responder.ExtKeyUsage, x509.ExtKeyUsageOCSPSigning) {
+		return errors.New("delegated OCSP responder certificate is missing the OCSPSigning extended key usage")
+	}
+
+	now := time.Now()
+	if now.Before(responder.NotBefore) || now.After(responder.NotAfter) {
+		return errors.New("delegated OCSP responder certificate is expired or not yet valid")
+	}
+
+	if err := resp.CheckSignatureFrom(responder); err != nil {
+		return fmt.Errorf("bad signature on OCSP response from delegated responder: %w", err)
+	}
+	return nil
 }
 
 func fetchOCSP(cert, issuer *x509.Certificate) ([]byte, error) {
@@ -150,7 +186,7 @@ func fetchOCSP(cert, issuer *x509.Certificate) ([]byte, error) {
 				return io.ReadAll(resp.Body)
 			}()
 			if err != nil {
-				lastError = err
+				lastError = fmt.Errorf("error querying OCSP server %s: %w", server, err)
 				continue
 			}
 
@@ -158,6 +194,9 @@ func fetchOCSP(cert, issuer *x509.Certificate) ([]byte, error) {
 		}
 	}
 
+	if lastError == nil {
+		lastError = errors.New("no OCSP servers could be reached")
+	}
 	return nil, lastError
 }
 
