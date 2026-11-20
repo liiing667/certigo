@@ -16,6 +16,7 @@
 package jceks
 
 import (
+	"bytes"
 	"crypto/x509"
 	"encoding/binary"
 	"fmt"
@@ -101,10 +102,19 @@ func readString(r io.Reader) (string, error) {
 }
 
 func writeString(w io.Writer, str string) error {
-	if err := binary.Write(w, binary.BigEndian, uint16(len(str))); err != nil {
+	// The length prefix must be the length of the modified UTF-8 encoding, which differs from the UTF-8 length
+	// for strings containing NULs or codepoints outside the basic multilingual plane.
+	var encoded bytes.Buffer
+	if err := writeModifiedUTF8(&encoded, str); err != nil {
 		return err
 	}
-	if err := writeModifiedUTF8(w, str); err != nil {
+	if encoded.Len() > maxAliasLen {
+		return fmt.Errorf("%w: modified UTF-8 encoding of string is too long", ErrInvalidString)
+	}
+	if err := binary.Write(w, binary.BigEndian, uint16(encoded.Len())); err != nil {
+		return err
+	}
+	if _, err := w.Write(encoded.Bytes()); err != nil {
 		return err
 	}
 

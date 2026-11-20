@@ -22,7 +22,6 @@ import (
 	"encoding/asn1"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"maps"
 	"os"
@@ -140,11 +139,20 @@ func WithMaxPrivateKeyBytes(maxBytes uint) ParseOption {
 
 // Parse parses the key store from the specified reader using default settings. It is equivalent to calling
 // ParseWithOptions without any options.
+//
+// The password is required: the integrity of the key store is always verified against the password before Parse
+// returns, and a nil password is rejected with an error that is ErrInvalidPassword. If the password is incorrect or
+// the key store was modified, Parse returns an error that is ErrIntegrityProtectionViolation.
 func (ks *KeyStore) Parse(r io.Reader, password []byte) error {
 	return ks.ParseWithOptions(r, password)
 }
 
 // ParseWithOptions parses the key store from the specified reader.
+//
+// The password is required: the integrity of the key store is always verified against the password before
+// ParseWithOptions returns, and a nil password is rejected with an error that is ErrInvalidPassword. If the password
+// is incorrect or the key store was modified, ParseWithOptions returns an error that is
+// ErrIntegrityProtectionViolation.
 func (ks *KeyStore) ParseWithOptions(r io.Reader, password []byte, options ...ParseOption) error {
 	ks.trustedCerts = make(map[string]*trustedCertEntry)
 	ks.privateKeys = make(map[string]*privateKeyEntry)
@@ -154,15 +162,15 @@ func (ks *KeyStore) ParseWithOptions(r io.Reader, password []byte, options ...Pa
 		return fmt.Errorf("failed to configure parser: %w", err)
 	}
 
-	var md hash.Hash
-	if password != nil {
-		encodedPassword, err := encodeIntegrityPassword(string(password))
-		if err != nil {
-			return err
-		}
-		md = makeIntegrityHash(encodedPassword)
-		r = io.TeeReader(r, md)
+	if password == nil {
+		return fmt.Errorf("%w: an integrity password is required to verify the key store", ErrInvalidPassword)
 	}
+	encodedPassword, err := encodeIntegrityPassword(string(password))
+	if err != nil {
+		return err
+	}
+	md := makeIntegrityHash(encodedPassword)
+	r = io.TeeReader(r, md)
 
 	version, err := parseHeader(r)
 	if err != nil {
@@ -176,6 +184,9 @@ func (ks *KeyStore) ParseWithOptions(r io.Reader, password []byte, options ...Pa
 	count, err := readInt32(r)
 	if err != nil {
 		return fmt.Errorf("%w: failed to read entry count", ErrInvalidJCEKSData)
+	}
+	if count < 0 {
+		return fmt.Errorf("%w: unexpected negative entry count: %d", ErrInvalidJCEKSData, count)
 	}
 	for i := 0; i < int(count); i++ {
 		tag, err := readUint32(r)
@@ -200,17 +211,15 @@ func (ks *KeyStore) ParseWithOptions(r io.Reader, password []byte, options ...Pa
 		}
 	}
 
-	if md != nil {
-		computed := md.Sum([]byte{})
-		actual := make([]byte, len(computed))
-		_, err := io.ReadFull(r, actual)
-		if err != nil {
-			return fmt.Errorf("%w: failed to read integrity checksum: %w", ErrInvalidJCEKSData, err)
-		}
-		if subtle.ConstantTimeCompare(computed, actual) != 1 {
-			return fmt.Errorf("%w: keystore was tampered with or password was incorrect",
-				ErrIntegrityProtectionViolation)
-		}
+	computed := md.Sum([]byte{})
+	actual := make([]byte, len(computed))
+	_, err = io.ReadFull(r, actual)
+	if err != nil {
+		return fmt.Errorf("%w: failed to read integrity checksum: %w", ErrInvalidJCEKSData, err)
+	}
+	if subtle.ConstantTimeCompare(computed, actual) != 1 {
+		return fmt.Errorf("%w: keystore was tampered with or password was incorrect",
+			ErrIntegrityProtectionViolation)
 	}
 
 	return nil
@@ -349,10 +358,13 @@ func (ks *KeyStore) parsePrivateKey(r io.Reader, cfg *parseConfig) error {
 	if err != nil {
 		return err
 	}
+	if nCerts < 0 {
+		return fmt.Errorf("%w: unexpected negative certificate count: %d", ErrInvalidJCEKSData, nCerts)
+	}
 	for j := 0; j < int(nCerts); j++ {
 		cert, err := readCertificate(r, cfg.maxCertBytes)
 		if err != nil {
-			return nil
+			return err
 		}
 		entry.certs = append(entry.certs, cert)
 	}

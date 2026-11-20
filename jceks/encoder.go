@@ -156,7 +156,9 @@ func (e *Encoder) addEncryptedPrivateKey(alias string, timestamp time.Time,
 	var buf bytes.Buffer
 
 	_ = writeUint32(&buf, privateKeyEntryTag)
-	_ = writeString(&buf, alias)
+	if err := writeString(&buf, alias); err != nil {
+		return err
+	}
 	_ = writeDate(&buf, timestamp)
 	_ = writeBytes(&buf, protectedKey)
 
@@ -183,7 +185,9 @@ func (e *Encoder) AddTrustedCertificate(alias string, timestamp time.Time, certD
 	var buf bytes.Buffer
 
 	_ = writeUint32(&buf, trustedCertEntryTag)
-	_ = writeString(&buf, alias)
+	if err := writeString(&buf, alias); err != nil {
+		return err
+	}
 	_ = writeDate(&buf, timestamp)
 	_ = writeCertificate(&buf, certDER)
 
