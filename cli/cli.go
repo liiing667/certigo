@@ -45,7 +45,7 @@ var (
 
 	connect                   = app.Command("connect", "Connect to a server and print its certificate(s).")
 	connectTo                 = connect.Arg("server[:port]", "Hostname or IP to connect to, with optional port.").Required().String()
-	connectName               = connect.Flag("name", "Override the server name used for Server Name Indication (SNI).").Short('n').String()
+	connectName               = connect.Flag("name", "Override the server name sent in Server Name Indication (SNI). Only affects the TLS handshake, not certificate verification.").Short('n').String()
 	connectCaPath             = connect.Flag("ca", "Path to CA bundle (system default if unspecified).").ExistingFile()
 	connectCert               = connect.Flag("cert", "Client certificate chain for connecting to server (PEM).").ExistingFile()
 	connectKey                = connect.Flag("key", "Private key for client certificate, if not in same file (PEM).").ExistingFile()
@@ -56,8 +56,9 @@ var (
 	connectPem                = connect.Flag("pem", "Write output as PEM blocks instead of human-readable format.").Short('m').Bool()
 	connectJSON               = connect.Flag("json", "Write output as machine-readable JSON format.").Short('j').Bool()
 	connectFirst              = connect.Flag("first", "Only display the first certificate. This flag can be paired with --json or --pem.").Short('l').Bool()
-	connectVerify             = connect.Flag("verify", "Verify certificate chain.").Bool()
-	connectVerifyExpectedName = connect.Flag("expected-name", "Name expected in the server TLS certificate. Defaults to name from SNI or, if SNI not overridden, the hostname to connect to.").String()
+	connectVerify             = connect.Flag("verify", "Verify certificate chain and exit non-zero if verification fails.").Bool()
+	connectVerifyExpectedName = connect.Flag("expected-name", "Name expected in the server TLS certificate (DNS name, IP address, or SPIFFE ID). Defaults to the hostname or IP to connect to, independent of SNI.").String()
+	connectInsecure           = connect.Flag("insecure", "Skip certificate chain verification entirely. The certificate chain is still printed.").Bool()
 
 	verify         = app.Command("verify", "Verify a certificate chain from file/stdin against a name.")
 	verifyFile     = verify.Arg("file", "Certificate file to dump (or stdin if not specified).").ExistingFile()
@@ -182,6 +183,9 @@ func Run(args []string, tty terminal.Terminal) int {
 		if connectStartTLS == nil && connectIdentity != nil {
 			return printErr("error: --identity can only be used with --start-tls")
 		}
+		if *connectInsecure && (*connectVerify || *connectVerifyExpectedName != "" || *connectCaPath != "") {
+			return printErr("error: --insecure cannot be combined with --verify, --expected-name, or --ca\n")
+		}
 		connState, cri, err := starttls.GetConnectionState(
 			*connectStartTLS, *connectName, *connectTo, *connectIdentity,
 			*connectCert, *connectKey, *connectProxy, *connectTimeout)
@@ -201,21 +205,18 @@ func Run(args []string, tty terminal.Terminal) int {
 			}
 		}
 
-		// Determine what name the server's certificate should match
-		var expectedNameInCertificate string
-		switch {
-		case *connectVerifyExpectedName != "":
-			// Use the explicitly provided name
-			expectedNameInCertificate = *connectVerifyExpectedName
-		case *connectName != "":
-			// Use the provided SNI
-			expectedNameInCertificate = *connectName
-		default:
-			// Use the hostname/IP from the connect string
-			expectedNameInCertificate = strings.Split(*connectTo, ":")[0]
+		if !*connectInsecure {
+			// Determine what name the server's certificate should match. This
+			// is deliberately decoupled from SNI (--name): it defaults to the
+			// hostname or IP we dialed, and can be overridden explicitly with
+			// --expected-name (DNS name, IP address, or SPIFFE ID).
+			expectedNameInCertificate := *connectVerifyExpectedName
+			if expectedNameInCertificate == "" {
+				expectedNameInCertificate = starttls.HostnameFromConnectTarget(*connectTo)
+			}
+			verifyResult := lib.VerifyChain(connState.PeerCertificates, connState.OCSPResponse, expectedNameInCertificate, *connectCaPath)
+			result.VerifyResult = &verifyResult
 		}
-		verifyResult := lib.VerifyChain(connState.PeerCertificates, connState.OCSPResponse, expectedNameInCertificate, *connectCaPath)
-		result.VerifyResult = &verifyResult
 
 		certList := result.Certificates
 		if *connectFirst && len(certList) > 0 {
@@ -235,10 +236,12 @@ func Run(args []string, tty terminal.Terminal) int {
 				_, _ = fmt.Fprintf(stdout, "** CERTIFICATE %d **\n", i+1)
 				_, _ = fmt.Fprintf(stdout, "%s\n\n", lib.EncodeX509ToText(cert, terminalWidth, *verbose))
 			}
-			lib.PrintVerifyResult(stdout, *result.VerifyResult)
+			if result.VerifyResult != nil {
+				lib.PrintVerifyResult(stdout, *result.VerifyResult)
+			}
 		}
 
-		if *connectVerify && len(result.VerifyResult.Error) > 0 {
+		if *connectVerify && result.VerifyResult != nil && len(result.VerifyResult.Error) > 0 {
 			return 1
 		}
 	case verify.FullCommand():

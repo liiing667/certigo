@@ -45,7 +45,13 @@ func tlsConfigForConnect(connectName, connectTo, clientCert, clientKey string) (
 	if connectName != "" {
 		hostname = connectName
 	} else {
-		hostname = strings.Split(connectTo, ":")[0]
+		hostname = HostnameFromConnectTarget(connectTo)
+	}
+
+	// SNI must be a DNS hostname, never an IP literal (RFC 6066, Section 3).
+	// Go's TLS client also refuses to send one, so leave ServerName empty.
+	if net.ParseIP(hostname) != nil {
+		hostname = ""
 	}
 
 	conf := &tls.Config{
@@ -76,6 +82,22 @@ func tlsConfigForConnect(connectName, connectTo, clientCert, clientKey string) (
 
 	cri := setGetClientCertificateCallback(conf, &cert)
 	return conf, cri, nil
+}
+
+// HostnameFromConnectTarget extracts the hostname or IP address from a
+// connect target of the form "host", "host:port", "[v6addr]" or
+// "[v6addr]:port". It is used both to derive the default SNI server name
+// and the default name to verify the server's certificate against.
+func HostnameFromConnectTarget(connectTo string) string {
+	host := connectTo
+	if h, _, err := net.SplitHostPort(connectTo); err == nil {
+		host = h
+	}
+	// Strip brackets from a bracketed IPv6 literal without a port.
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+	return host
 }
 
 func setGetClientCertificateCallback(conf *tls.Config, cert *tls.Certificate) **tls.CertificateRequestInfo {
