@@ -40,12 +40,50 @@ type connectResult struct {
 	err   error
 }
 
+// ConnectError records which stage of a connection attempt failed. Error()
+// preserves the original error text for callers that print it, while
+// ErrorStage lets a retry or report consumer bind the failure to the same
+// connection generation as the target and certificate chain.
+type ConnectError struct {
+	Stage string
+	Err   error
+}
+
+func (e *ConnectError) Error() string {
+	if e == nil || e.Err == nil {
+		return "connection error"
+	}
+	return e.Err.Error()
+}
+func (e *ConnectError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+// ErrorStage returns the connection stage recorded in err, or the empty string
+// if err did not come from a staged connection attempt.
+func ErrorStage(err error) string {
+	var connectErr *ConnectError
+	if errors.As(err, &connectErr) {
+		return connectErr.Stage
+	}
+	return ""
+}
+
 func tlsConfigForConnect(connectName, connectTo, clientCert, clientKey string) (*tls.Config, **tls.CertificateRequestInfo, error) {
 	var hostname string
 	if connectName != "" {
 		hostname = connectName
 	} else {
-		hostname = strings.Split(connectTo, ":")[0]
+		hostname = HostnameFromConnectTarget(connectTo)
+	}
+
+	// SNI must be a DNS hostname, never an IP literal (RFC 6066, Section 3).
+	// Go's TLS client also refuses to send one, so leave ServerName empty.
+	if net.ParseIP(hostname) != nil {
+		hostname = ""
 	}
 
 	conf := &tls.Config{
@@ -78,6 +116,22 @@ func tlsConfigForConnect(connectName, connectTo, clientCert, clientKey string) (
 	return conf, cri, nil
 }
 
+// HostnameFromConnectTarget extracts the hostname or IP address from a
+// connect target of the form "host", "host:port", "[v6addr]" or
+// "[v6addr]:port". It is used both to derive the default SNI server name and
+// the default name to verify the server's certificate against.
+func HostnameFromConnectTarget(connectTo string) string {
+	host := connectTo
+	if h, _, err := net.SplitHostPort(connectTo); err == nil {
+		host = h
+	}
+	// Strip brackets from a bracketed IPv6 literal without a port.
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+	return host
+}
+
 func setGetClientCertificateCallback(conf *tls.Config, cert *tls.Certificate) **tls.CertificateRequestInfo {
 	var captured *tls.CertificateRequestInfo
 
@@ -95,12 +149,15 @@ func withDefaultPort(addr string, portN uint16) string {
 	port := strconv.Itoa(int(portN))
 	if strings.HasPrefix(addr, "[") && strings.HasSuffix(addr, "]") {
 		// IPv6 without a port
-		return net.JoinHostPort(addr, port)
+		return net.JoinHostPort(addr[1:len(addr)-1], port)
 	}
 	if strings.ContainsAny(addr, ":") {
 		// There are two cases when an address could contain a `:`
 		// If it's an IPv6 address without a port, it's handled above
 		// Otherwise, it's any kind of address with a port
+		if net.ParseIP(addr) != nil {
+			return net.JoinHostPort(addr, port)
+		}
 		return addr
 	}
 	// No colon means no port.
@@ -118,6 +175,18 @@ func GetConnectionState(startTLSType, connectName, connectTo, identity, clientCe
 	var cri **tls.CertificateRequestInfo
 	var tlsConfig *tls.Config
 
+	// Freeze the connection target and protocol before starting any goroutine.
+	// A StartTLS retry must use the same host and protocol as the connection
+	// whose certificate chain it returns, rather than values from a later
+	// invocation.
+	protocol := startTLSType
+	target := connectTo
+	serverName := connectName
+	if connectProxy != nil {
+		proxyCopy := *connectProxy
+		connectProxy = &proxyCopy
+	}
+
 	var dialer Dialer = &net.Dialer{
 		Timeout:  timeout,
 		Deadline: time.Now().Add(timeout),
@@ -127,10 +196,10 @@ func GetConnectionState(startTLSType, connectName, connectTo, identity, clientCe
 	res := make(chan connectResult, 1)
 	go func() {
 		<-time.After(timeout)
-		res <- connectResult{nil, errors.New("timed out")}
+		res <- connectResult{nil, &ConnectError{Stage: "timeout", Err: errors.New("timed out")}}
 	}()
 
-	tlsConfig, cri, err = tlsConfigForConnect(connectName, connectTo, clientCert, clientKey)
+	tlsConfig, cri, err = tlsConfigForConnect(serverName, target, clientCert, clientKey)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -143,9 +212,9 @@ func GetConnectionState(startTLSType, connectName, connectTo, identity, clientCe
 	}
 
 	go func() {
-		switch startTLSType {
+		switch protocol {
 		case "":
-			addr := withDefaultPort(connectTo, 443)
+			addr := withDefaultPort(target, 443)
 			conn, err := dialWithDialer(dialer, timeout, "tcp", addr, tlsConfig)
 			if err != nil {
 				res <- connectResult{nil, err}
@@ -155,10 +224,10 @@ func GetConnectionState(startTLSType, connectName, connectTo, identity, clientCe
 			state := conn.ConnectionState()
 			res <- connectResult{&state, nil}
 		case "ldap":
-			addr := withDefaultPort(connectTo, 389)
+			addr := withDefaultPort(target, 389)
 			nc, err := net.DialTimeout("tcp", addr, timeout)
 			if err != nil {
-				res <- connectResult{nil, err}
+				res <- connectResult{nil, &ConnectError{Stage: "dial", Err: err}}
 				return
 			}
 			l := ldap.NewConn(nc, false)
@@ -167,31 +236,30 @@ func GetConnectionState(startTLSType, connectName, connectTo, identity, clientCe
 
 			err = l.StartTLS(tlsConfig)
 			if err != nil {
-				res <- connectResult{nil, err}
+				res <- connectResult{nil, &ConnectError{Stage: "tls_handshake", Err: err}}
 				return
 			}
 			s, ok := l.TLSConnectionState()
 			if !ok {
-				res <- connectResult{nil, fmt.Errorf("LDAP connection isn't TLS after StartTLS")}
+				res <- connectResult{nil, &ConnectError{Stage: "starttls", Err: fmt.Errorf("LDAP connection isn't TLS after StartTLS")}}
 				return
 			}
 			state = &s
 			res <- connectResult{state, nil}
 		case "mysql":
-			if err := mysql.RegisterTLSConfig("certigo", tlsConfig); err != nil {
-				res <- connectResult{nil, fmt.Errorf("mysql registration error: %w", err)}
-				return
-			}
-			addr := withDefaultPort(connectTo, 3306)
-			state, err = mysql.DumpTLS(fmt.Sprintf("%s@tcp(%s)/?tls=certigo&timeout=%s", identity, addr, timeout.String()))
+			addr := withDefaultPort(target, 3306)
+			state, err = mysql.DumpTLSWithConfig(
+				fmt.Sprintf("%s@tcp(%s)/?tls=true&timeout=%s", identity, addr, timeout.String()),
+				tlsConfig,
+			)
 			if err != nil {
-				res <- connectResult{nil, err}
+				res <- connectResult{nil, &ConnectError{Stage: "starttls", Err: err}}
 				return
 			}
 			res <- connectResult{state, nil}
 		case "postgres", "psql":
 			// Setting sslmode to "require" skips verification.
-			addr := withDefaultPort(connectTo, 5432)
+			addr := withDefaultPort(target, 5432)
 			uri := fmt.Sprintf("postgres://%s@%s/?sslmode=require&connect_timeout=%d", identity, addr, timeout/time.Second)
 			if clientCert != "" {
 				uri += fmt.Sprintf("&sslcert=%s", clientCert)
@@ -201,7 +269,7 @@ func GetConnectionState(startTLSType, connectName, connectTo, identity, clientCe
 			}
 			state, err = pq.DumpTLSWithConfig(uri, tlsConfig)
 			if err != nil {
-				res <- connectResult{nil, err}
+				res <- connectResult{nil, &ConnectError{Stage: "starttls", Err: err}}
 				return
 			}
 			res <- connectResult{state, nil}
@@ -209,44 +277,59 @@ func GetConnectionState(startTLSType, connectName, connectTo, identity, clientCe
 			// Go's net/smtp doesn't support timeouts, so if we hit a timeout we might
 			// leak a Go routine (at least until we hit a lower-level TCP timeout or such).
 			// This is not an issue for Certigo since it's just a short-lived CLI utility.
-			addr := withDefaultPort(connectTo, 25)
+			addr := withDefaultPort(target, 25)
 			client, err := smtp.Dial(addr)
 			if err != nil {
-				res <- connectResult{nil, err}
+				res <- connectResult{nil, &ConnectError{Stage: "dial", Err: err}}
 				return
 			}
 			err = client.Hello(identity)
 			if err != nil {
-				res <- connectResult{nil, err}
+				_ = client.Close()
+				res <- connectResult{nil, &ConnectError{Stage: "smtp_hello", Err: err}}
 				return
 			}
 			err = client.StartTLS(tlsConfig)
 			if err != nil {
-				res <- connectResult{nil, err}
+				_ = client.Close()
+				res <- connectResult{nil, &ConnectError{Stage: "tls_handshake", Err: err}}
 				return
 			}
 			state, ok := client.TLSConnectionState()
 			if !ok {
-				res <- connectResult{nil, errors.New("SMTP connection isn't TLS after StartTLS")}
+				_ = client.Close()
+				res <- connectResult{nil, &ConnectError{Stage: "starttls", Err: errors.New("SMTP connection isn't TLS after StartTLS")}}
+				return
 			}
 			res <- connectResult{&state, nil}
 		case "ftp":
-			addr := withDefaultPort(connectTo, 21)
+			addr := withDefaultPort(target, 21)
 			state, err = dumpTLSConnStateFromFTP(dialer, addr, tlsConfig)
+			if err != nil && ErrorStage(err) == "" {
+				err = &ConnectError{Stage: "starttls", Err: err}
+			}
 			res <- connectResult{state, err}
 		case "imap":
-			addr := withDefaultPort(connectTo, 143)
+			addr := withDefaultPort(target, 143)
 			state, err = dumpTLSConnStateFromIMAP(dialer, addr, tlsConfig)
+			if err != nil && ErrorStage(err) == "" {
+				err = &ConnectError{Stage: "starttls", Err: err}
+			}
 			res <- connectResult{state, err}
 		default:
-			res <- connectResult{nil, fmt.Errorf("unknown StartTLS protocol: %s", startTLSType)}
+			res <- connectResult{nil, &ConnectError{Stage: "protocol", Err: fmt.Errorf("unknown StartTLS protocol: %s", protocol)}}
 		}
 	}()
 
 	result := <-res
 
 	if result.err != nil {
-		return nil, nil, fmt.Errorf("error connecting: %v", result.err)
+		wrapped := fmt.Errorf("error connecting: %w", result.err)
+		stage := ErrorStage(result.err)
+		if stage == "" {
+			stage = "connect"
+		}
+		return nil, nil, &ConnectError{Stage: stage, Err: wrapped}
 	}
 
 	if cri == nil {

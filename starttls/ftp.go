@@ -26,31 +26,32 @@ import (
 func dumpTLSConnStateFromFTP(dialer Dialer, address string, config *tls.Config) (*tls.ConnectionState, error) {
 	c, err := dialer.Dial("tcp", address)
 	if err != nil {
-		return nil, err
+		return nil, &ConnectError{Stage: "dial", Err: err}
 	}
 
 	conn := c.(*net.TCPConn)
+	defer func() { _ = conn.Close() }()
 	status, err := readFTP(conn)
 	if err != nil {
-		return nil, err
+		return nil, &ConnectError{Stage: "starttls", Err: err}
 	}
 	if status != 220 {
-		return nil, fmt.Errorf("FTP server responded with status %d, was expecting 220", status)
+		return nil, &ConnectError{Stage: "starttls", Err: fmt.Errorf("FTP server responded with status %d, was expecting 220", status)}
 	}
 
 	fmt.Fprintf(conn, "AUTH TLS\r\n")
 	status, err = readFTP(conn)
 	if err != nil {
-		return nil, err
+		return nil, &ConnectError{Stage: "starttls", Err: err}
 	}
 	if status != 234 {
-		return nil, fmt.Errorf("FTP server responded with status %d, was expecting 234", status)
+		return nil, &ConnectError{Stage: "starttls", Err: fmt.Errorf("FTP server responded with status %d, was expecting 234", status)}
 	}
 
 	tlsConn := tls.Client(conn, config)
 	err = tlsConn.Handshake()
 	if err != nil {
-		return nil, err
+		return nil, &ConnectError{Stage: "tls_handshake", Err: err}
 	}
 
 	state := tlsConn.ConnectionState()

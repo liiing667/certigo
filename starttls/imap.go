@@ -25,31 +25,32 @@ import (
 func dumpTLSConnStateFromIMAP(dialer Dialer, address string, config *tls.Config) (*tls.ConnectionState, error) {
 	c, err := dialer.Dial("tcp", address)
 	if err != nil {
-		return nil, err
+		return nil, &ConnectError{Stage: "dial", Err: err}
 	}
 
 	conn := c.(*net.TCPConn)
+	defer func() { _ = conn.Close() }()
 	status, err := readIMAP(conn)
 	if err != nil {
-		return nil, err
+		return nil, &ConnectError{Stage: "starttls", Err: err}
 	}
 	if status != "OK" {
-		return nil, fmt.Errorf("IMAP server responded with %s, was expecting OK", status)
+		return nil, &ConnectError{Stage: "starttls", Err: fmt.Errorf("IMAP server responded with %s, was expecting OK", status)}
 	}
 
 	fmt.Fprintf(conn, "1 STARTTLS\r\n")
 	status, err = readIMAP(conn)
 	if err != nil {
-		return nil, err
+		return nil, &ConnectError{Stage: "starttls", Err: err}
 	}
 	if status != "OK" {
-		return nil, fmt.Errorf("IMAP server responded with %s, was expecting OK", status)
+		return nil, &ConnectError{Stage: "starttls", Err: fmt.Errorf("IMAP server responded with %s, was expecting OK", status)}
 	}
 
 	tlsConn := tls.Client(conn, config)
 	err = tlsConn.Handshake()
 	if err != nil {
-		return nil, err
+		return nil, &ConnectError{Stage: "tls_handshake", Err: err}
 	}
 
 	state := tlsConn.ConnectionState()

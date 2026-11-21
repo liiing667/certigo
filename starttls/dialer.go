@@ -49,7 +49,7 @@ func dialWithDialer(dialer Dialer, timeout time.Duration, network, addr string, 
 
 	rawConn, err := dialer.Dial(network, addr)
 	if err != nil {
-		return nil, err
+		return nil, &ConnectError{Stage: "dial", Err: err}
 	}
 
 	conn := tls.Client(rawConn, config)
@@ -65,7 +65,7 @@ func dialWithDialer(dialer Dialer, timeout time.Duration, network, addr string, 
 
 	if err != nil {
 		_ = rawConn.Close()
-		return nil, err
+		return nil, &ConnectError{Stage: "tls_handshake", Err: err}
 	}
 
 	return conn, nil

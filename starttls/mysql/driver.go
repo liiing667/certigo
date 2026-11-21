@@ -140,6 +140,14 @@ func (d MySQLDriver) Open(dsn string) (driver.Conn, error) {
 // added for use by Certigo in order to make it possible to dump TLS certificates
 // from a MySQL server for debugging.
 func DumpTLS(dsn string) (*tls.ConnectionState, error) {
+	return DumpTLSWithConfig(dsn, nil)
+}
+
+// DumpTLSWithConfig is like DumpTLS, but uses tlsConfig for the connection
+// instead of a configuration registered globally under a DSN name. Passing the
+// configuration directly keeps concurrent connections and retries from
+// observing a TLS config that belongs to another connection attempt.
+func DumpTLSWithConfig(dsn string, tlsConfig *tls.Config) (*tls.ConnectionState, error) {
 	var err error
 
 	// New mysqlConn
@@ -154,6 +162,9 @@ func DumpTLS(dsn string) (*tls.ConnectionState, error) {
 	mc.parseTime = mc.cfg.ParseTime
 	mc.strict = mc.cfg.Strict
 
+	if tlsConfig != nil {
+		mc.cfg.tls = tlsConfig
+	}
 	if mc.cfg.tls == nil {
 		return nil, errors.New("certigo/mysql error: TLS must be enabled to dump TLS data")
 	}
