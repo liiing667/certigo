@@ -50,6 +50,14 @@ type Encoder struct {
 	_ [0]func() // Incomparable
 }
 
+// stagedEntry is a fully encoded keystore entry that has not yet been committed to the Encoder. Entries are staged
+// while a batch is being built so that the Encoder is only modified once the whole batch is known to be valid. This
+// keeps failed imports from leaving partial key material behind, which could otherwise be mixed into a later retry.
+type stagedEntry struct {
+	alias string
+	data  []byte
+}
+
 // PrivateKeyCipher represents an encryption method that can protect the confidentiality of private keys in a JCEKS
 // file.
 type PrivateKeyCipher interface {
@@ -84,22 +92,39 @@ func (e *Encoder) SetProhibitDuplicateAliases(prohibit bool) {
 	e.prohibitDuplicateAliases = prohibit
 }
 
-func (e *Encoder) appendEntry(alias string, data []byte) error {
+// commitEntries applies a batch of fully encoded entries to the Encoder atomically. It either commits every entry
+// in the batch or, if the batch contains a duplicate alias while duplicates are prohibited, changes nothing. Entries
+// that overwrite an earlier entry in the same batch or an existing alias replace it, matching reader semantics.
+func (e *Encoder) commitEntries(batch []stagedEntry) error {
 	if e.aliasIndices == nil {
 		e.aliasIndices = make(map[string]int)
 	}
 
-	if idx, exists := e.aliasIndices[alias]; exists {
-		if e.prohibitDuplicateAliases {
-			return fmt.Errorf("%w: %q", ErrDuplicateAlias, alias)
+	// Validate the whole batch against both the current state and the batch itself before touching the Encoder. A
+	// failed import must never leave partial key material behind that could be mixed into a later retry.
+	if e.prohibitDuplicateAliases {
+		batchAliases := make(map[string]struct{}, len(batch))
+		for _, entry := range batch {
+			if _, exists := e.aliasIndices[entry.alias]; exists {
+				return fmt.Errorf("%w: %q", ErrDuplicateAlias, entry.alias)
+			}
+			if _, repeated := batchAliases[entry.alias]; repeated {
+				return fmt.Errorf("%w: %q", ErrDuplicateAlias, entry.alias)
+			}
+			batchAliases[entry.alias] = struct{}{}
 		}
-		e.entries[idx] = nil
-		e.entryCount--
 	}
 
-	e.aliasIndices[alias] = len(e.entries)
-	e.entries = append(e.entries, data)
-	e.entryCount++
+	for _, entry := range batch {
+		if idx, exists := e.aliasIndices[entry.alias]; exists {
+			e.entries[idx] = nil
+			e.entryCount--
+		}
+
+		e.aliasIndices[entry.alias] = len(e.entries)
+		e.entries = append(e.entries, entry.data)
+		e.entryCount++
+	}
 
 	return nil
 }
@@ -124,33 +149,33 @@ func (e *Encoder) AddPrivateKeyPKCS1(alias string, timestamp time.Time,
 		return fmt.Errorf("failed to encode encrypted private key info: %w", err)
 	}
 
-	if err := e.addEncryptedPrivateKey(alias, timestamp, protectedKey, certificatesDER); err != nil {
+	entry, err := buildPrivateKeyEntry(alias, timestamp, protectedKey, certificatesDER)
+	if err != nil {
 		return err
 	}
 
-	return nil
+	return e.commitEntries([]stagedEntry{entry})
 }
 
-func (e *Encoder) addEncryptedPrivateKey(alias string, timestamp time.Time,
-	protectedKey []byte, certificatesDER [][]byte) error {
-
+func buildPrivateKeyEntry(alias string, timestamp time.Time,
+	protectedKey []byte, certificatesDER [][]byte) (stagedEntry, error) {
 	if len(alias) > maxAliasLen {
-		return fmt.Errorf("%w: alias is too long", ErrInvalidString)
+		return stagedEntry{}, fmt.Errorf("%w: alias is too long", ErrInvalidString)
 	}
 	if len(certificatesDER) > math.MaxInt32 {
-		return fmt.Errorf("%w: too many certificates", ErrInvalidCertificates)
+		return stagedEntry{}, fmt.Errorf("%w: too many certificates", ErrInvalidCertificates)
 	}
 	for i, certDER := range certificatesDER {
 		if len(certDER) < 1 {
-			return fmt.Errorf("%w: certificate %d has no data", ErrInvalidCertificates, i)
+			return stagedEntry{}, fmt.Errorf("%w: certificate %d has no data", ErrInvalidCertificates, i)
 		}
 		if len(certDER) > math.MaxInt32 {
-			return fmt.Errorf("%w: certificate %d has a DER encoding that exceeds JCEKS capacity",
+			return stagedEntry{}, fmt.Errorf("%w: certificate %d has a DER encoding that exceeds JCEKS capacity",
 				ErrInvalidCertificates, i)
 		}
 	}
 	if len(protectedKey) > math.MaxInt32 {
-		return fmt.Errorf("%w: protected key is too large", ErrKeyProtectionFailed)
+		return stagedEntry{}, fmt.Errorf("%w: protected key is too large", ErrKeyProtectionFailed)
 	}
 
 	var buf bytes.Buffer
@@ -165,19 +190,24 @@ func (e *Encoder) addEncryptedPrivateKey(alias string, timestamp time.Time,
 		_ = writeCertificate(&buf, certDER)
 	}
 
-	if err := e.appendEntry(alias, buf.Bytes()); err != nil {
-		return err
-	}
-
-	return nil
+	return stagedEntry{alias: alias, data: buf.Bytes()}, nil
 }
 
 // AddTrustedCertificate adds a trusted certificate to the keystore. The certificate is not associated with a private
 // key and receives no confidentiality protection. Storing a certificate in the keystore provides a verifiable record of
 // trust if the keystore's integrity protection is secure. The certificate must be provided in X.509 DER form.
 func (e *Encoder) AddTrustedCertificate(alias string, timestamp time.Time, certDER []byte) error {
+	entry, err := buildTrustedCertificateEntry(alias, timestamp, certDER)
+	if err != nil {
+		return err
+	}
+
+	return e.commitEntries([]stagedEntry{entry})
+}
+
+func buildTrustedCertificateEntry(alias string, timestamp time.Time, certDER []byte) (stagedEntry, error) {
 	if len(alias) > maxAliasLen {
-		return fmt.Errorf("%w: alias is too long", ErrInvalidString)
+		return stagedEntry{}, fmt.Errorf("%w: alias is too long", ErrInvalidString)
 	}
 
 	var buf bytes.Buffer
@@ -187,33 +217,37 @@ func (e *Encoder) AddTrustedCertificate(alias string, timestamp time.Time, certD
 	_ = writeDate(&buf, timestamp)
 	_ = writeCertificate(&buf, certDER)
 
-	if err := e.appendEntry(alias, buf.Bytes()); err != nil {
-		return err
-	}
-
-	return nil
+	return stagedEntry{alias: alias, data: buf.Bytes()}, nil
 }
 
 // AddKeyStore adds the trusted certificates and private keys from an existing keystore to the Encoder. The existing
 // keystore's integrity password is ignored. Existing private keys are added to the Encoder without decrypting them, so
 // no private key passwords are needed, but any existing problems with the private keys will be preserved.
 func (e *Encoder) AddKeyStore(ks *KeyStore) error {
+	// Build the whole batch before committing anything: if any entry cannot be encoded, the Encoder must remain
+	// unchanged so that a retry does not mix partial key material with the entries committed before the failure.
+	batch := make([]stagedEntry, 0, len(ks.trustedCerts)+len(ks.privateKeys))
+
 	for alias, tc := range ks.trustedCerts {
-		if err := e.AddTrustedCertificate(alias, tc.timestamp, tc.cert.Raw); err != nil {
+		entry, err := buildTrustedCertificateEntry(alias, tc.timestamp, tc.cert.Raw)
+		if err != nil {
 			return fmt.Errorf("failed to add trusted certificate %q: %w", alias, err)
 		}
+		batch = append(batch, entry)
 	}
 	for alias, sk := range ks.privateKeys {
 		certificatesDER := make([][]byte, 0, len(sk.certs))
 		for _, cert := range sk.certs {
 			certificatesDER = append(certificatesDER, cert.Raw)
 		}
-		if err := e.addEncryptedPrivateKey(alias, sk.timestamp, sk.protectedKey, certificatesDER); err != nil {
+		entry, err := buildPrivateKeyEntry(alias, sk.timestamp, sk.protectedKey, certificatesDER)
+		if err != nil {
 			return fmt.Errorf("failed to add private key %q: %w", alias, err)
 		}
+		batch = append(batch, entry)
 	}
 
-	return nil
+	return e.commitEntries(batch)
 }
 
 // counterWriter passes through writes to an underlying io.Writer, but keeps track of the number of bytes written and
@@ -261,7 +295,9 @@ func (j *jceksDigester) WriteDigest(w io.Writer) error {
 }
 
 // WriteTo writes a JCEKS file to the given io.Writer. The keystore contains the key material that has been added to the
-// Encoder in previous calls.
+// Encoder in previous calls. The complete keystore, including its integrity checksum, is assembled in memory before
+// anything is written to w. A failure therefore never leaves a truncated or otherwise partial keystore behind, which a
+// caller or a process restart could otherwise mistake for valid key material.
 func (e *Encoder) WriteTo(w io.Writer) (n int64, err error) {
 	if !e.setIntegrityPassword {
 		return 0, fmt.Errorf("refusing to write JCEKS due to likely bug: %w", ErrNoIntegrityPassword)
@@ -270,20 +306,33 @@ func (e *Encoder) WriteTo(w io.Writer) (n int64, err error) {
 		return 0, fmt.Errorf("%w: %d entries exceeds JCEKS limit", ErrTooManyEntries, e.entryCount)
 	}
 
-	cw := &counterWriter{w: w}
+	var complete bytes.Buffer
 	jd := newJCEKSDigester(e.integrityPassword)
-	out := io.MultiWriter(cw, jd)
+	out := io.MultiWriter(&complete, jd)
 
-	_ = writeUint32(out, uint32(jceksMagic))
-	_ = writeUint32(out, uint32(jceksVersion))
-	_ = writeUint32(out, uint32(e.entryCount))
+	if err = writeUint32(out, uint32(jceksMagic)); err != nil {
+		return 0, err
+	}
+	if err = writeUint32(out, uint32(jceksVersion)); err != nil {
+		return 0, err
+	}
+	if err = writeUint32(out, uint32(e.entryCount)); err != nil {
+		return 0, err
+	}
 	for _, entry := range e.entries {
 		if len(entry) < 1 {
 			continue
 		}
-		_, _ = out.Write(entry)
+		if _, err = out.Write(entry); err != nil {
+			return 0, err
+		}
 	}
-	_ = jd.WriteDigest(out)
+	if err = jd.WriteDigest(out); err != nil {
+		return 0, err
+	}
 
-	return cw.Results()
+	// The keystore is fully formed and checksummed at this point, so the caller only ever receives a complete store.
+	nn, err := w.Write(complete.Bytes())
+
+	return int64(nn), err
 }

@@ -21,7 +21,10 @@ import (
 	"crypto/x509"
 	"errors"
 	"flag"
+	"maps"
 	"os"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -303,4 +306,209 @@ func TestProhibitDuplicateAliases(t *testing.T) {
 	err = enc.AddTrustedCertificate("alias", now, cert.Raw)
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrDuplicateAlias)
+}
+
+// failingCipher is a PrivateKeyCipher that always fails. It simulates a key protection failure while a batch of
+// entries is being imported.
+type failingCipher struct{}
+
+func (failingCipher) encryptPrivateKey(privateKeyInfo) (encryptedPrivateKeyInfo, error) {
+	return encryptedPrivateKeyInfo{}, errors.New("simulated key protection failure")
+}
+
+// TestFailedPrivateKeyImportLeavesEncoderUnchanged verifies that a failure while adding one entry never leaves partial
+// key material in the Encoder. A retry after such a failure must start from the same state the Encoder was in before
+// the failed attempt, otherwise the retried import could be mixed with incomplete material from the first attempt.
+func TestFailedPrivateKeyImportLeavesEncoderUnchanged(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2025, 4, 24, 0, 0, 0, 0, time.UTC)
+
+	leafCert, err := LoadPEMCert("testdata/private-key.crt")
+	require.NoError(t, err)
+
+	var enc Encoder
+
+	// A trusted entry that must remain exactly as committed before the failed private-key import.
+	require.NoError(t, enc.AddTrustedCertificate("ca", now, leafCert.Raw))
+
+	rsaPriv, err := LoadPEMKey("testdata/private-key.key")
+	require.NoError(t, err)
+	pkcs1 := x509.MarshalPKCS1PrivateKey(rsaPriv)
+
+	err = enc.AddPrivateKeyPKCS1("leaf", now, pkcs1, [][]byte{leafCert.Raw}, failingCipher{})
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrKeyProtectionFailed)
+
+	// Nothing from the failed attempt may have been committed.
+	require.Equal(t, uint(1), enc.entryCount)
+	require.Len(t, enc.entries, 1)
+	require.NotNil(t, enc.entries[0])
+	require.Equal(t, map[string]int{"ca": 0}, enc.aliasIndices)
+
+	// A retry with a working cipher must produce a clean store with both entries and the certificate chain still
+	// attached to its own alias ("leaf"), rather than to an alias carried over from the failed attempt.
+	rnd := sha3.NewShake128()
+	cipher, err := PBEWithMD5AndDES3CBC([]byte("changeit"), rnd, 20)
+	require.NoError(t, err)
+
+	require.NoError(t, enc.AddPrivateKeyPKCS1("leaf", now, pkcs1, [][]byte{leafCert.Raw}, cipher))
+	require.NoError(t, enc.SetIntegrityPassword("changeit"))
+
+	var buf bytes.Buffer
+	_, err = enc.WriteTo(&buf)
+	require.NoError(t, err)
+
+	reloaded, err := LoadFromReader(&buf, []byte("changeit"))
+	require.NoError(t, err)
+	require.Equal(t, []string{"ca"}, reloaded.ListCerts())
+	require.Equal(t, []string{"leaf"}, reloaded.ListPrivateKeys())
+
+	_, certs, err := reloaded.GetPrivateKeyAndCerts("leaf", []byte("changeit"))
+	require.NoError(t, err)
+	require.Len(t, certs, 1)
+	require.Equal(t, leafCert.Raw, certs[0].Raw)
+}
+
+// TestAddKeyStoreIsAtomic verifies that importing an existing keystore commits nothing when any entry in the batch
+// cannot be encoded. The Encoder must stay byte-for-byte unchanged so that a retry cannot mix partial material in.
+func TestAddKeyStoreIsAtomic(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2025, 4, 24, 0, 0, 0, 0, time.UTC)
+
+	cert, err := LoadPEMCert("testdata/trusted-cert.crt")
+	require.NoError(t, err)
+
+	var enc Encoder
+	require.NoError(t, enc.AddTrustedCertificate("existing", now, cert.Raw))
+
+	beforeEntries := enc.entryCount
+	beforeAliases := maps.Clone(enc.aliasIndices)
+
+	// A keystore containing an unencodable private-key entry (an alias longer than the JCEKS maximum).
+	bad := &KeyStore{
+		trustedCerts: map[string]*trustedCertEntry{
+			"new-cert": {timestamp: now, cert: cert},
+		},
+		privateKeys: map[string]*privateKeyEntry{
+			strings.Repeat("a", maxAliasLen+1): {
+				timestamp:    now,
+				protectedKey: []byte{1, 2, 3},
+				certs:        []*x509.Certificate{cert},
+			},
+		},
+	}
+
+	err = enc.AddKeyStore(bad)
+	require.Error(t, err)
+
+	// The failed import changed nothing.
+	require.Equal(t, beforeEntries, enc.entryCount)
+	require.Equal(t, beforeAliases, enc.aliasIndices)
+	require.Len(t, enc.entries, 1)
+
+	// A retry with a valid keystore commits the complete batch in one shot.
+	good := &KeyStore{
+		trustedCerts: map[string]*trustedCertEntry{
+			"new-cert": {timestamp: now, cert: cert},
+		},
+	}
+	require.NoError(t, enc.AddKeyStore(good))
+	require.Equal(t, []string{"existing", "new-cert"}, enc.aliasIndicesSortedForTest())
+}
+
+// aliasIndicesSortedForTest returns the committed aliases in sorted order for stable assertions.
+func (e *Encoder) aliasIndicesSortedForTest() []string {
+	aliases := make([]string, 0, len(e.aliasIndices))
+	for alias := range e.aliasIndices {
+		aliases = append(aliases, alias)
+	}
+	slices.Sort(aliases)
+
+	return aliases
+}
+
+// TestWriteToNeverEmitsPartialStore verifies that when the destination writer fails, it never receives a fragment of
+// the keystore. The complete, checksummed keystore is assembled first, so a failed write (or a process restart before
+// retrying it) cannot leave callers trusting a truncated or otherwise incomplete store.
+func TestWriteToNeverEmitsPartialStore(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2025, 4, 24, 0, 0, 0, 0, time.UTC)
+
+	cert, err := LoadPEMCert("testdata/trusted-cert.crt")
+	require.NoError(t, err)
+
+	var enc Encoder
+	require.NoError(t, enc.AddTrustedCertificate("ca1", now, cert.Raw))
+	require.NoError(t, enc.SetIntegrityPassword("changeit"))
+
+	// Build the expected complete keystore using a healthy writer.
+	var expected bytes.Buffer
+	n, err := enc.WriteTo(&expected)
+	require.NoError(t, err)
+	require.Equal(t, int64(expected.Len()), n)
+
+	failing := &failingWriter{}
+	nn, err := enc.WriteTo(failing)
+	require.Error(t, err)
+
+	// The destination receives at most one write, and it is the single complete keystore: never a partial prefix.
+	require.Equal(t, int64(0), nn)
+	require.Equal(t, 1, failing.total)
+	require.Equal(t, expected.Len(), failing.lastLen)
+
+	// The Encoder itself is unaffected by the failed write and can be written again after a restart/retry.
+	var retry bytes.Buffer
+	_, err = enc.WriteTo(&retry)
+	require.NoError(t, err)
+	require.Equal(t, expected.Bytes(), retry.Bytes())
+
+	// The emitted keystore is a complete, parseable store with intact integrity protection.
+	reloaded, err := LoadFromReader(bytes.NewReader(expected.Bytes()), []byte("changeit"))
+	require.NoError(t, err)
+	require.Equal(t, []string{"ca1"}, reloaded.ListCerts())
+}
+
+type failingWriter struct {
+	total   int
+	lastLen int
+}
+
+func (fw *failingWriter) Write(p []byte) (int, error) {
+	fw.total++
+	fw.lastLen = len(p)
+
+	return 0, errors.New("simulated destination failure")
+}
+
+// TestAddKeyStoreIsAtomicWhenDuplicatesProhibited verifies that a batch rejected because of a duplicate alias commits
+// nothing at all, including its non-conflicting entries.
+func TestAddKeyStoreIsAtomicWhenDuplicatesProhibited(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2025, 4, 24, 0, 0, 0, 0, time.UTC)
+
+	cert, err := LoadPEMCert("testdata/trusted-cert.crt")
+	require.NoError(t, err)
+
+	var enc Encoder
+	enc.SetProhibitDuplicateAliases(true)
+	require.NoError(t, enc.AddTrustedCertificate("existing", now, cert.Raw))
+
+	duplicate := &KeyStore{
+		trustedCerts: map[string]*trustedCertEntry{
+			"existing": {timestamp: now, cert: cert},
+			"new-cert": {timestamp: now, cert: cert},
+		},
+	}
+
+	err = enc.AddKeyStore(duplicate)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrDuplicateAlias)
+
+	// The rejected batch committed nothing, not even the non-conflicting "new-cert" entry.
+	require.Equal(t, uint(1), enc.entryCount)
+	require.Equal(t, []string{"existing"}, enc.aliasIndicesSortedForTest())
 }
