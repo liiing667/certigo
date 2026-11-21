@@ -232,6 +232,21 @@ Found 2 valid certificate chain(s):
 	=> Entrust Root Certification Authority [self-signed] [SHA1-RSA]
 ```
 
+Verification reports are snapshots. Each `verify` or `connect --verify`
+invocation reads its trust roots once and records a `policy_version`, a
+content-derived `root_set_version`, and one `chain_reports` entry per valid
+path with that path's `anchor`. Reordering a CA bundle does not change the
+root set version, while adding or removing a root does. A root that has been
+removed from the bundle therefore cannot anchor a later verification, even if
+an earlier invocation used it.
+
+If path validation fails, `failure_path` contains the attempted path, the
+failing certificate, and its zero-based `index` and human-readable `position`.
+Exit codes are derived from the same report: zero only when at least one chain
+validated and every reported chain has a trusted anchor. Explicit CA bundles
+also include their roots in the report; for the system trust store the root set
+is represented by its digest and count.
+
 Advanced examples on how to combine JSON output with [jq](https://stedolan.github.io/jq/) filtering:
 
 ```

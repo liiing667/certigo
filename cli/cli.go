@@ -238,7 +238,7 @@ func Run(args []string, tty terminal.Terminal) int {
 			lib.PrintVerifyResult(stdout, *result.VerifyResult)
 		}
 
-		if *connectVerify && len(result.VerifyResult.Error) > 0 {
+		if *connectVerify && !result.VerifyResult.Verified() {
 			return 1
 		}
 	case verify.FullCommand():
@@ -272,7 +272,7 @@ func Run(args []string, tty terminal.Terminal) int {
 		} else {
 			lib.PrintVerifyResult(stdout, verifyResult)
 		}
-		if verifyResult.Error != "" {
+		if !verifyResult.Verified() {
 			return 1
 		}
 	}
