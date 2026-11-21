@@ -7,7 +7,8 @@ all: \
 	$(addsuffix .crt,$(TARGETS)) \
 	$(addsuffix .p12,$(TARGETS)) \
 	$(addsuffix .p7b,$(TARGETS)) \
-	$(addsuffix .jceks,$(TARGETS))
+	$(addsuffix .jceks,$(TARGETS)) \
+	example-multi-signer.p7b
 
 clean:
 	rm -f example-*
@@ -26,6 +27,14 @@ clean:
 
 %.p7b: %.crt
 	openssl crl2pkcs7 -nocrl -certfile $< -out $@
+
+# PKCS7 SignedData with two signer certificates, for multi-signer tests.
+example-multi-signer.p7b: example-custom-oid.crt example-custom-oid.key example-small-key.crt example-small-key.key
+	printf 'multi-signer pkcs7 test\n' | openssl cms -sign -binary -md sha256 \
+		-signer example-custom-oid.crt -inkey example-custom-oid.key \
+		-signer example-small-key.crt -inkey example-small-key.key \
+		-nodetach -outform PEM | \
+		sed 's/^-----BEGIN CMS-----$$/-----BEGIN PKCS7-----/; s/^-----END CMS-----$$/-----END PKCS7-----/' > $@
 
 %.jceks: %.p12
 	keytool -importkeystore \
