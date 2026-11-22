@@ -37,12 +37,79 @@ type simpleVerifyCert struct {
 	signatureAlgorithm x509.SignatureAlgorithm
 }
 
+// OCSP revocation statuses, as reported in JSON output.
+const (
+	ocspStatusGood    = "good"
+	ocspStatusRevoked = "revoked"
+	ocspStatusUnknown = "unknown"
+)
+
 type SimpleVerification struct {
 	Error          string               `json:"error,omitempty"`
 	OCSPStatus     *ocsp.Response       `json:"ocsp_response,omitempty"`
 	OCSPWasStapled bool                 `json:"ocsp_was_stapled,omitempty"`
 	OCSPError      string               `json:"ocsp_error,omitempty"`
+	OCSPStatuses   []*OCSPStatus        `json:"ocsp_statuses,omitempty"`
 	Chains         [][]simpleVerifyCert `json:"chains"`
+}
+
+// OCSPStatus records the evidence behind one chain's OCSP result. The
+// certificate serial, responder, source, and failure stage all come from the
+// same response generation as Status.
+type OCSPStatus struct {
+	Chain              int       `json:"chain"`
+	SerialNumber       string    `json:"serial_number,omitempty"`
+	Issuer             string    `json:"issuer,omitempty"`
+	Responder          string    `json:"responder,omitempty"`
+	Source             string    `json:"source,omitempty"`
+	Stage              string    `json:"stage,omitempty"`
+	Status             string    `json:"status,omitempty"`
+	SignatureAlgorithm string    `json:"signature_algorithm,omitempty"`
+	SignatureVerified  bool      `json:"signature_verified,omitempty"`
+	WasStapled         bool      `json:"was_stapled,omitempty"`
+	ProducedAt         time.Time `json:"produced_at,omitzero"`
+	ThisUpdate         time.Time `json:"this_update,omitzero"`
+	NextUpdate         time.Time `json:"next_update,omitzero"`
+	RevokedAt          time.Time `json:"revoked_at,omitzero"`
+	RevocationReason   string    `json:"revocation_reason,omitempty"`
+	Error              string    `json:"error,omitempty"`
+}
+
+// Revoked reports whether OCSP indicates that the certificate has been
+// revoked. A revoked status always takes precedence over a good status from
+// another chain or responder generation.
+func (s SimpleVerification) Revoked() bool {
+	if s.OCSPStatus != nil && s.OCSPStatus.Status == ocsp.Revoked {
+		return true
+	}
+	for _, status := range s.OCSPStatuses {
+		if status != nil && status.Status == ocspStatusRevoked {
+			return true
+		}
+	}
+	return false
+}
+
+// RevocationCheckFailed reports whether the certificate advertises OCSP but
+// the revocation status could not be determined. Callers that are verifying a
+// certificate should treat this as a failure rather than a warning.
+func (s SimpleVerification) RevocationCheckFailed() bool {
+	if s.OCSPError != "" {
+		return true
+	}
+	for _, status := range s.OCSPStatuses {
+		if status != nil && status.Error != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// VerificationFailed reports whether the verification result must produce a
+// non-zero exit code. A chain error, a revoked certificate, or an
+// indeterminate revocation check all fail closed.
+func (s SimpleVerification) VerificationFailed() bool {
+	return s.Error != "" || s.Revoked() || s.RevocationCheckFailed()
 }
 
 type SimpleResult struct {
@@ -65,7 +132,11 @@ func (s SimpleResult) MarshalJSON() ([]byte, error) {
 		out["verify_result"] = s.VerifyResult
 	}
 	if s.TLSConnectionState != nil {
-		out["tls_connection"] = EncodeTLSToObject(s.TLSConnectionState)
+		var ocspStatuses []*OCSPStatus
+		if s.VerifyResult != nil {
+			ocspStatuses = s.VerifyResult.OCSPStatuses
+		}
+		out["tls_connection"] = EncodeTLSToObjectWithOCSP(s.TLSConnectionState, ocspStatuses)
 	}
 	if s.CertificateRequestInfo != nil {
 		encoded, err := EncodeCRIToObject(s.CertificateRequestInfo)
@@ -161,13 +232,35 @@ func VerifyChain(certs []*x509.Certificate, ocspStaple []byte, expectedName, caP
 		}
 	}
 
-	for _, chain := range chains {
-		status, err := checkOCSP(chain, ocspStaple)
+	var (
+		ocspStatuses = make([]*OCSPStatus, len(chains))
+		ocspChecked  bool
+	)
+	for chainIndex, chain := range chains {
+		// Keep every chain's OCSP conclusion local. In particular, do not
+		// carry a previous chain's status or error into this one when a fetch
+		// fails or times out.
+		status, evidence, err := checkOCSPWithEvidence(chain, ocspStaple)
+		if evidence != nil && !errors.Is(err, errSkippedRevocationCheck) {
+			evidenceCopy := *evidence
+			evidenceCopy.Chain = chainIndex
+			ocspStatuses[chainIndex] = &evidenceCopy
+			ocspChecked = true
+		}
 		if err == nil {
-			result.OCSPStatus = status
+			if status != nil && (result.OCSPStatus == nil || preferOCSPResponse(result.OCSPStatus, status)) {
+				result.OCSPStatus = status
+			}
+			if result.OCSPStatus != nil && result.OCSPStatus.Status == ocsp.Revoked {
+				// Revocation is authoritative. Don't let an error checking
+				// an alternate chain hide it from the legacy aggregate field.
+				result.OCSPError = ""
+			}
 		}
 		if err != nil && !errors.Is(err, errSkippedRevocationCheck) {
-			result.OCSPError = err.Error()
+			if result.OCSPStatus == nil || result.OCSPStatus.Status != ocsp.Revoked {
+				result.OCSPError = err.Error()
+			}
 		}
 
 		aChain := []simpleVerifyCert{}
@@ -182,6 +275,9 @@ func VerifyChain(certs []*x509.Certificate, ocspStaple []byte, expectedName, caP
 			aChain = append(aChain, aCert)
 		}
 		result.Chains = append(result.Chains, aChain)
+	}
+	if ocspChecked {
+		result.OCSPStatuses = ocspStatuses
 	}
 	return result
 }
@@ -225,6 +321,20 @@ func printCertificateChains(out io.Writer, result SimpleVerification) {
 }
 
 func printOCSPStatus(out io.Writer, result SimpleVerification) {
+	if len(result.OCSPStatuses) > 0 {
+		for i, evidence := range result.OCSPStatuses {
+			if evidence == nil {
+				continue
+			}
+			chainLabel := ""
+			if len(result.OCSPStatuses) > 1 {
+				chainLabel = fmt.Sprintf(" for chain [%d]", i)
+			}
+			printOCSPEvidence(out, chainLabel, evidence)
+		}
+		return
+	}
+
 	if result.OCSPError != "" {
 		_, _ = fmt.Fprint(out, red.SprintlnFunc()("Certificate has OCSP extension, but was unable to check status:"))
 		_, _ = fmt.Fprintf(out, "\t%s\n\n", result.OCSPError)
@@ -260,6 +370,84 @@ func printOCSPStatus(out io.Writer, result SimpleVerification) {
 		}
 
 		_, _ = fmt.Fprint(out, "\n\n")
+	}
+}
+
+func printOCSPEvidence(out io.Writer, chainLabel string, evidence *OCSPStatus) {
+	if evidence.Error != "" {
+		_, _ = fmt.Fprint(out, red.SprintfFunc()("Certificate has OCSP extension, but was unable to check status%s:", chainLabel))
+		_, _ = fmt.Fprintf(out, "\n\t%s", evidence.Error)
+		if evidence.Stage != "" {
+			_, _ = fmt.Fprintf(out, " (stage: %s)", evidence.Stage)
+		}
+		if evidence.SerialNumber != "" {
+			_, _ = fmt.Fprintf(out, "\n\tSerial: %s", evidence.SerialNumber)
+		}
+		if evidence.Issuer != "" {
+			_, _ = fmt.Fprintf(out, "\n\tIssuer: %s", evidence.Issuer)
+		}
+		if evidence.Source != "" {
+			_, _ = fmt.Fprintf(out, "\n\tSource: %s", evidence.Source)
+		}
+		_, _ = fmt.Fprint(out, "\n\n")
+		return
+	}
+
+	statusCode := ocspStatusCode(evidence.Status)
+	description, ok := revocationStatusDescription[statusCode]
+	if !ok {
+		description = "Unknown"
+	}
+	statusColor, ok := revocationStatusColor[statusCode]
+	if !ok {
+		statusColor = yellow
+	}
+
+	wasStapled := ""
+	if evidence.WasStapled {
+		wasStapled = " (was stapled)"
+	}
+
+	_, _ = fmt.Fprint(out, statusColor.SprintfFunc()("Checked OCSP status for certificate%s%s, got:", chainLabel, wasStapled))
+	_, _ = fmt.Fprintf(out, "\n\t%s (last update: %s)", description, evidence.ProducedAt.Format(time.RFC822))
+	if evidence.SerialNumber != "" {
+		_, _ = fmt.Fprintf(out, "\n\tSerial: %s", evidence.SerialNumber)
+	}
+	if evidence.Issuer != "" {
+		_, _ = fmt.Fprintf(out, "\n\tIssuer: %s", evidence.Issuer)
+	}
+	if evidence.Responder != "" {
+		_, _ = fmt.Fprintf(out, "\n\tResponder: %s", evidence.Responder)
+	}
+	if evidence.SignatureAlgorithm != "" {
+		_, _ = fmt.Fprintf(out, "\n\tResponse Signature: %s", evidence.SignatureAlgorithm)
+		if evidence.SignatureVerified {
+			_, _ = fmt.Fprint(out, " (verified)")
+		}
+	}
+	if evidence.Source != "" {
+		_, _ = fmt.Fprintf(out, "\n\tSource: %s", evidence.Source)
+	}
+
+	if statusCode == ocsp.Revoked {
+		reason := evidence.RevocationReason
+		if reason == "" {
+			reason = "Unknown"
+		}
+		_, _ = fmt.Fprintf(out, "\n\tWas revoked at %s due to: %s", evidence.RevokedAt.Format(time.RFC822), reason)
+	}
+
+	_, _ = fmt.Fprint(out, "\n\n")
+}
+
+func ocspStatusCode(name string) int {
+	switch name {
+	case ocspStatusGood:
+		return ocsp.Good
+	case ocspStatusRevoked:
+		return ocsp.Revoked
+	default:
+		return ocsp.Unknown
 	}
 }
 

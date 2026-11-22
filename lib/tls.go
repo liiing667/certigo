@@ -31,8 +31,10 @@ import (
 
 // TLSDescription has the basic information about a TLS connection
 type TLSDescription struct {
-	Version string `json:"version"`
-	Cipher  string `json:"cipher"`
+	Version      string        `json:"version"`
+	Cipher       string        `json:"cipher"`
+	OCSPStapled  bool          `json:"ocsp_stapled,omitempty"`
+	OCSPStatuses []*OCSPStatus `json:"ocsp_statuses,omitempty"`
 }
 
 // CertificateRequestInfo has the basic information about requested client certificates
@@ -119,11 +121,19 @@ func EncodeTLSInfoToText(tcs *tls.ConnectionState, cri *tls.CertificateRequestIn
 
 // EncodeTLSToObject returns a JSON-marshallable description of a TLS connection
 func EncodeTLSToObject(t *tls.ConnectionState) interface{} {
+	return EncodeTLSToObjectWithOCSP(t, nil)
+}
+
+// EncodeTLSToObjectWithOCSP returns a JSON-marshallable description of a TLS
+// connection together with the OCSP evidence produced for that connection.
+func EncodeTLSToObjectWithOCSP(t *tls.ConnectionState, ocspStatuses []*OCSPStatus) interface{} {
 	version := lookup(tlsVersions, t.Version)
 	cipher := lookup(cipherSuites, t.CipherSuite)
 	return &TLSDescription{
-		version.Slug,
-		cipher.Slug,
+		Version:      version.Slug,
+		Cipher:       cipher.Slug,
+		OCSPStapled:  len(t.OCSPResponse) > 0,
+		OCSPStatuses: ocspStatuses,
 	}
 }
 
