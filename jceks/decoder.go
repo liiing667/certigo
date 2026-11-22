@@ -146,8 +146,22 @@ func (ks *KeyStore) Parse(r io.Reader, password []byte) error {
 
 // ParseWithOptions parses the key store from the specified reader.
 func (ks *KeyStore) ParseWithOptions(r io.Reader, password []byte, options ...ParseOption) error {
-	ks.trustedCerts = make(map[string]*trustedCertEntry)
-	ks.privateKeys = make(map[string]*privateKeyEntry)
+	if ks == nil {
+		return fmt.Errorf("%w: nil key store", ErrInvalidJCEKSData)
+	}
+
+	// Parse into a separate KeyStore and publish it only after the entire file,
+	// including the integrity check, has been validated. A failed attempt must
+	// not leave entries from a previous parse or a partially parsed file behind:
+	// callers retry with another password or alias and must only ever observe a
+	// complete key store.
+	ks.trustedCerts = nil
+	ks.privateKeys = nil
+
+	parsed := &KeyStore{
+		trustedCerts: make(map[string]*trustedCertEntry),
+		privateKeys:  make(map[string]*privateKeyEntry),
+	}
 
 	cfg, err := makeParseConfig(options...)
 	if err != nil {
@@ -177,6 +191,9 @@ func (ks *KeyStore) ParseWithOptions(r io.Reader, password []byte, options ...Pa
 	if err != nil {
 		return fmt.Errorf("%w: failed to read entry count", ErrInvalidJCEKSData)
 	}
+	if count < 0 {
+		return fmt.Errorf("%w: unexpected negative entry count: %d", ErrInvalidJCEKSData, count)
+	}
 	for i := 0; i < int(count); i++ {
 		tag, err := readUint32(r)
 		if err != nil {
@@ -184,12 +201,12 @@ func (ks *KeyStore) ParseWithOptions(r io.Reader, password []byte, options ...Pa
 		}
 		switch tag {
 		case privateKeyEntryTag:
-			err := ks.parsePrivateKey(r, cfg)
+			err := parsed.parsePrivateKey(r, cfg)
 			if err != nil {
 				return fmt.Errorf("%w: failed to parse private key entry %d: %w", ErrInvalidJCEKSData, i, err)
 			}
 		case trustedCertEntryTag:
-			err := ks.parseTrustedCert(r, cfg)
+			err := parsed.parseTrustedCert(r, cfg)
 			if err != nil {
 				return fmt.Errorf("%w: failed to parse certificate entry %d: %w", ErrInvalidJCEKSData, i, err)
 			}
@@ -213,6 +230,9 @@ func (ks *KeyStore) ParseWithOptions(r io.Reader, password []byte, options ...Pa
 		}
 	}
 
+	ks.trustedCerts = parsed.trustedCerts
+	ks.privateKeys = parsed.privateKeys
+
 	return nil
 }
 
@@ -220,6 +240,10 @@ func (ks *KeyStore) ParseWithOptions(r io.Reader, password []byte, options ...Pa
 // points to a non-private key entry.
 func (ks *KeyStore) GetPrivateKeyAndCerts(alias string, password []byte) (
 	key crypto.PrivateKey, certs []*x509.Certificate, err error) {
+
+	if ks == nil {
+		return nil, nil, nil
+	}
 
 	entry, ok := ks.privateKeys[alias]
 	if !ok {
@@ -234,18 +258,56 @@ func (ks *KeyStore) GetPrivateKeyAndCerts(alias string, password []byte) (
 		return nil, nil, err
 	}
 
-	return key, entry.certs, nil
+	// Return a copy so consumers cannot change the committed key store while
+	// they are still exporting it.
+	return key, slices.Clone(entry.certs), nil
 }
 
 // GetCert retrieves the specified certificate. Returns nil if the certificate does not exist or alias points to a
 // non-certificate entry.
 func (ks *KeyStore) GetCert(alias string) (*x509.Certificate, error) {
+	if ks == nil {
+		return nil, nil
+	}
+
 	entry, ok := ks.trustedCerts[alias]
 	if !ok {
 		return nil, nil
 	}
 
 	return entry.cert, nil
+}
+
+// HasAlias reports whether alias names either a trusted certificate or a
+// private key entry in the key store. The two entry types share a single alias
+// namespace.
+func (ks *KeyStore) HasAlias(alias string) bool {
+	if ks == nil {
+		return false
+	}
+	if _, ok := ks.trustedCerts[alias]; ok {
+		return true
+	}
+	_, ok := ks.privateKeys[alias]
+	return ok
+}
+
+// ListAliases lists the names of all entries in the key store. JCEKS uses a
+// single alias namespace, so a name appears at most once.
+func (ks *KeyStore) ListAliases() []string {
+	if ks == nil {
+		return nil
+	}
+
+	aliases := make(map[string]struct{}, len(ks.trustedCerts)+len(ks.privateKeys))
+	for alias := range ks.trustedCerts {
+		aliases[alias] = struct{}{}
+	}
+	for alias := range ks.privateKeys {
+		aliases[alias] = struct{}{}
+	}
+
+	return slices.Sorted(maps.Keys(aliases))
 }
 
 // ListPrivateKeys lists the names of the private keys stored in the key store.
@@ -349,10 +411,13 @@ func (ks *KeyStore) parsePrivateKey(r io.Reader, cfg *parseConfig) error {
 	if err != nil {
 		return err
 	}
+	if nCerts < 0 {
+		return fmt.Errorf("%w: unexpected negative certificate count: %d", ErrInvalidJCEKSData, nCerts)
+	}
 	for j := 0; j < int(nCerts); j++ {
 		cert, err := readCertificate(r, cfg.maxCertBytes)
 		if err != nil {
-			return nil
+			return err
 		}
 		entry.certs = append(entry.certs, cert)
 	}

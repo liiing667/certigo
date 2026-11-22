@@ -16,6 +16,7 @@
 package jceks
 
 import (
+	"bytes"
 	"crypto/rsa"
 	"os"
 	"testing"
@@ -114,4 +115,32 @@ func TestEmptyKeyStoreReadyToUse(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, sk)
 	require.Empty(t, keyCerts)
+}
+
+// A retry after a wrong password must not inherit the entries that were
+// parsed before the integrity check failed. The successful retry publishes
+// one complete key store, and the failed attempt publishes nothing.
+func TestParseFailureDoesNotPublishEntries(t *testing.T) {
+	data, err := os.ReadFile("testdata/private-key.jceks")
+	require.NoError(t, err)
+
+	var ks KeyStore
+	err = ks.Parse(bytes.NewReader(data), []byte("wrong-store-password"))
+	require.ErrorIs(t, err, ErrIntegrityProtectionViolation)
+	require.Empty(t, ks.ListAliases())
+	require.Empty(t, ks.ListCerts())
+	require.Empty(t, ks.ListPrivateKeys())
+	require.False(t, ks.HasAlias("private-key-some-alias"))
+
+	// Retrying on the same KeyStore object must start from an empty state and
+	// then commit exactly the complete entry from the correct key store.
+	err = ks.Parse(bytes.NewReader(data), []byte("store-password"))
+	require.NoError(t, err)
+	require.Equal(t, []string{"private-key-some-alias"}, ks.ListAliases())
+	require.True(t, ks.HasAlias("private-key-some-alias"))
+
+	key, certs, err := ks.GetPrivateKeyAndCerts("private-key-some-alias", []byte("key-password"))
+	require.NoError(t, err)
+	require.NotNil(t, key)
+	require.Len(t, certs, 2)
 }

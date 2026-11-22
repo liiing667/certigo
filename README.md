@@ -59,6 +59,7 @@ Commands:
 
     -f, --format=FORMAT      Format of given input (PEM, DER, JCEKS, PKCS12; heuristic if missing).
     -p, --password=PASSWORD  Password for PKCS12/JCEKS key stores (reads from TTY if missing).
+    -a, --alias=ALIAS        Only export the PKCS12/JCEKS entry with this alias and its certificate chain.
     -m, --pem                Write output as PEM blocks instead of human-readable format.
     -j, --json               Write output as machine-readable JSON format.
     -l, --first              Only display the first certificate. This flag can be paired with --json or --pem.

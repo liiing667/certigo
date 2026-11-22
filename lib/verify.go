@@ -48,6 +48,7 @@ type SimpleVerification struct {
 type SimpleResult struct {
 	Certificates           []*x509.Certificate `json:"certificates"`
 	Formats                []string
+	CertificateAlias       string              `json:"-"`
 	VerifyResult           *SimpleVerification `json:"verify_result,omitempty"`
 	TLSConnectionState     *tls.ConnectionState
 	CertificateRequestInfo *tls.CertificateRequestInfo
@@ -56,7 +57,7 @@ type SimpleResult struct {
 func (s SimpleResult) MarshalJSON() ([]byte, error) {
 	certs := make([]interface{}, len(s.Certificates))
 	for i, c := range s.Certificates {
-		certs[i] = EncodeX509ToObject(c)
+		certs[i] = EncodeX509ToObjectWithAlias(c, s.CertificateAlias)
 	}
 
 	out := map[string]interface{}{}

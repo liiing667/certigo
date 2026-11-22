@@ -16,6 +16,7 @@
 package cli
 
 import (
+	"bytes"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -39,6 +40,7 @@ var (
 	dumpFiles    = dump.Arg("file", "Certificate file to dump (or stdin if not specified).").ExistingFiles()
 	dumpType     = dump.Flag("format", "Format of given input (PEM, DER, JCEKS, PKCS12; heuristic if missing).").Short('f').String()
 	dumpPassword = dump.Flag("password", "Password for PKCS12/JCEKS key stores (reads from TTY if missing).").Short('p').String()
+	dumpAlias    = dump.Flag("alias", "Only export the PKCS12/JCEKS entry with this alias and its complete certificate chain.").Short('a').String()
 	dumpPem      = dump.Flag("pem", "Write output as PEM blocks instead of human-readable format.").Short('m').Bool()
 	dumpJSON     = dump.Flag("json", "Write output as machine-readable JSON format.").Short('j').Bool()
 	dumpFirst    = dump.Flag("first", "Only display the first certificate. This flag can be paired with --json or --pem.").Short('l').Bool()
@@ -109,6 +111,18 @@ func Run(args []string, tty terminal.Terminal) int {
 	app.UsageTemplate(kingpin.LongHelpTemplate)
 
 	result := lib.SimpleResult{}
+	// Kingpin keeps flag values and appends to slice-valued arguments across
+	// Parse calls. Run may be reused in one process (notably by callers that
+	// retry after a wrong password), so start every dump from an empty
+	// transaction instead of inheriting aliases, files, or output choices from
+	// the previous invocation.
+	*dumpFiles = nil
+	*dumpType = ""
+	*dumpPassword = ""
+	*dumpAlias = ""
+	*dumpPem = false
+	*dumpJSON = false
+	*dumpFirst = false
 	command, err := app.Parse(args)
 	if err != nil {
 		return printErr("%s, try --help\n", err)
@@ -131,17 +145,37 @@ func Run(args []string, tty terminal.Terminal) int {
 
 		if *dumpPem {
 			dumped := 0
-			err = lib.ReadAsPEMFromFiles(files, *dumpType, tty.ReadPassword, func(block *pem.Block, format string) error {
+			var pemOutput bytes.Buffer
+			exportFormat := *dumpType
+			err = lib.ReadAsPEMFromFilesWithAlias(files, *dumpType, *dumpAlias, tty.ReadPassword, func(block *pem.Block, format string) error {
+				exportFormat = format
 				if *dumpFirst && dumped > 0 {
 					return nil
 				}
 
-				block.Headers = nil
+				// Work on a copy: the transaction may still need the headers
+				// to prove which alias and key bag each block belongs to.
+				outputBlock := *block
+				outputBlock.Headers = nil
 				dumped++
-				return pem.Encode(stdout, block)
+				return pem.Encode(&pemOutput, &outputBlock)
 			})
+			// Do not publish anything until the complete selected entry has
+			// been materialized. A parse, password, or key failure therefore
+			// leaves stdout untouched instead of exposing a partial PEM block
+			// or a subset of the requested entry.
+			if err == nil && pemOutput.Len() > 0 {
+				if _, writeErr := pemOutput.WriteTo(stdout); writeErr != nil {
+					return printErr("error: %s\n", (&lib.KeystoreExportError{
+						Format: lib.KeystoreFormat(strings.ToUpper(strings.TrimSpace(exportFormat))),
+						Alias:  *dumpAlias,
+						Stage:  lib.ExportStageOutput,
+						Err:    writeErr,
+					}).Error())
+				}
+			}
 		} else {
-			err = lib.ReadAsX509FromFiles(files, *dumpType, tty.ReadPassword, func(cert *x509.Certificate, format string, err error) error {
+			err = lib.ReadAsX509FromFilesWithAlias(files, *dumpType, *dumpAlias, tty.ReadPassword, func(cert *x509.Certificate, format string, err error) error {
 				if err != nil {
 					//nolint:staticcheck // See errorFromErrors
 					return fmt.Errorf("error parsing block: %s\n", strings.TrimSuffix(err.Error(), "\n"))
@@ -151,6 +185,9 @@ func Run(args []string, tty terminal.Terminal) int {
 				}
 				return nil
 			})
+			if err != nil {
+				return printErr("error: %s\n", strings.TrimSuffix(err.Error(), "\n"))
+			}
 
 			certList := result.Certificates
 			formatList := result.Formats
@@ -160,15 +197,24 @@ func Run(args []string, tty terminal.Terminal) int {
 				result.Certificates = certList
 				result.Formats = formatList
 			}
+			result.CertificateAlias = *dumpAlias
 
 			if *dumpJSON {
 				blob, _ := json.Marshal(result)
-				_, _ = fmt.Println(string(blob))
+				if _, writeErr := fmt.Fprintln(stdout, string(blob)); writeErr != nil {
+					return printErr("error: could not write JSON: %s\n", writeErr)
+				}
 			} else {
 				for i, cert := range result.Certificates {
-					_, _ = fmt.Fprintf(stdout, "** CERTIFICATE %d **\n", i+1)
-					_, _ = fmt.Fprintf(stdout, "Input Format: %s\n", result.Formats[i])
-					_, _ = fmt.Fprintf(stdout, "%s\n\n", lib.EncodeX509ToText(cert, terminalWidth, *verbose))
+					if _, writeErr := fmt.Fprintf(stdout, "** CERTIFICATE %d **\n", i+1); writeErr != nil {
+						return printErr("error: could not write certificate output: %s\n", writeErr)
+					}
+					if _, writeErr := fmt.Fprintf(stdout, "Input Format: %s\n", result.Formats[i]); writeErr != nil {
+						return printErr("error: could not write certificate output: %s\n", writeErr)
+					}
+					if _, writeErr := fmt.Fprintf(stdout, "%s\n\n", lib.EncodeX509ToTextWithAlias(cert, *dumpAlias, terminalWidth, *verbose)); writeErr != nil {
+						return printErr("error: could not write certificate output: %s\n", writeErr)
+					}
 				}
 			}
 		}

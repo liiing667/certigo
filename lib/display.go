@@ -178,12 +178,24 @@ func EncodeX509ToJSON(cert *x509.Certificate) []byte {
 
 // EncodeX509ToObject encodes an X.509 certificate into a JSON-serializable object.
 func EncodeX509ToObject(cert *x509.Certificate) interface{} {
-	return createSimpleCertificate("", cert)
+	return EncodeX509ToObjectWithAlias(cert, "")
+}
+
+// EncodeX509ToObjectWithAlias encodes an X.509 certificate into a
+// JSON-serializable object and records the key store alias that selected it.
+func EncodeX509ToObjectWithAlias(cert *x509.Certificate, alias string) interface{} {
+	return createSimpleCertificate(alias, cert)
 }
 
 // EncodeX509ToText encodes an X.509 certificate into human-readable text.
 func EncodeX509ToText(cert *x509.Certificate, terminalWidth int, verbose bool) []byte {
-	c := createSimpleCertificate("", cert)
+	return EncodeX509ToTextWithAlias(cert, "", terminalWidth, verbose)
+}
+
+// EncodeX509ToTextWithAlias encodes an X.509 certificate into human-readable
+// text and records the key store alias that selected it.
+func EncodeX509ToTextWithAlias(cert *x509.Certificate, alias string, terminalWidth int, verbose bool) []byte {
+	c := createSimpleCertificate(alias, cert)
 	c.Width = terminalWidth - 8 /* Need some margin for tab */
 
 	return displayCert(c, verbose)
