@@ -66,19 +66,25 @@ Commands:
   connect [<flags>] [<server:port>]
     Connect to a server and print its certificate(s).
 
-    -n, --name=NAME           Override the server name used for Server Name Indication (SNI).
+    -n, --name=NAME           Override the server name sent in Server Name Indication (SNI). Only affects the TLS handshake, not certificate verification.
         --ca=CA               Path to CA bundle (system default if unspecified).
         --cert=CERT           Client certificate chain for connecting to server (PEM).
         --key=KEY             Private key for client certificate, if not in same file (PEM).
-    -t, --start-tls=PROTOCOL  Enable StartTLS protocol ('ldap', 'mysql', 'postgres', 'smtp' or 'ftp').
+    -t, --start-tls=PROTOCOL  Enable StartTLS protocol ('ldap', 'mysql', 'postgres', 'psql', 'smtp', 'ftp' or 'imap').
         --identity=certigo    With --start-tls, sets the DB user or SMTP EHLO name.
         --proxy               Optional URI for HTTP(s) CONNECT proxy to dial connections with.
         --timeout=5s          Timeout for connecting to remote server (can be '5m', '1s', etc).
     -m, --pem                 Write output as PEM blocks instead of human-readable format.
     -j, --json                Write output as machine-readable JSON format.
     -l, --first               Only display the first certificate. This flag can be paired with --json or --pem.
-        --verify              Verify certificate chain.
-        --expected-name       Name expected in the server TLS certificate. Defaults to name from SNI or, if SNI not overridden, the hostname to connect to.
+        --verify              Verify certificate chain and exit non-zero if verification fails.
+        --expected-name       Name expected in the server TLS certificate (DNS name, IP address, or SPIFFE ID). Defaults to the hostname or IP to connect to, independent of SNI.
+        --insecure            Skip certificate chain verification entirely. The certificate chain is still printed.
+
+    StartTLS connections are retried once after a protocol rejection or TLS
+    handshake failure. The retry uses a fresh TLS configuration and a new
+    connection generation, so only the final connection's target, certificate
+    chain, and client-certificate request information are reported.
 
   verify --name=NAME [<flags>] [<file>]
     Verify a certificate chain from file/stdin against a name.

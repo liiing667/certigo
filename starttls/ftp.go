@@ -21,50 +21,76 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 )
 
 func dumpTLSConnStateFromFTP(dialer Dialer, address string, config *tls.Config) (*tls.ConnectionState, error) {
 	c, err := dialer.Dial("tcp", address)
 	if err != nil {
-		return nil, err
+		return nil, &ConnectError{Stage: stageForDialError(err), Err: err}
 	}
+	defer func() { _ = c.Close() }()
 
-	conn := c.(*net.TCPConn)
-	status, err := readFTP(conn)
+	reader := bufio.NewReader(c)
+	status, err := readFTPLine(reader)
 	if err != nil {
-		return nil, err
+		return nil, &ConnectError{Stage: stageStartTLS, Err: err}
 	}
 	if status != 220 {
-		return nil, fmt.Errorf("FTP server responded with status %d, was expecting 220", status)
+		return nil, &ConnectError{Stage: stageStartTLS, Err: fmt.Errorf("FTP server responded with status %d, was expecting 220", status)}
 	}
 
-	fmt.Fprintf(conn, "AUTH TLS\r\n")
-	status, err = readFTP(conn)
+	if _, err := fmt.Fprint(c, "AUTH TLS\r\n"); err != nil {
+		return nil, &ConnectError{Stage: stageStartTLS, Err: err}
+	}
+	status, err = readFTPLine(reader)
 	if err != nil {
-		return nil, err
+		return nil, &ConnectError{Stage: stageStartTLS, Err: err}
 	}
 	if status != 234 {
-		return nil, fmt.Errorf("FTP server responded with status %d, was expecting 234", status)
+		return nil, &ConnectError{Stage: stageStartTLS, Err: fmt.Errorf("FTP server responded with status %d, was expecting 234", status)}
 	}
 
-	tlsConn := tls.Client(conn, config)
+	tlsConn := tls.Client(c, config)
 	err = tlsConn.Handshake()
 	if err != nil {
-		return nil, err
+		return nil, &ConnectError{Stage: stageForNetworkError(err, stageTLSHandshake), Err: err}
 	}
 
 	state := tlsConn.ConnectionState()
 	return &state, nil
 }
 
+// readFTP retains the historical helper signature for callers that pass a
+// single TCP connection.
+//nolint:unused // Retained for compatibility with package-level callers.
 func readFTP(conn *net.TCPConn) (int, error) {
-	reader := bufio.NewReader(conn)
-	response, err := reader.ReadString('\n')
-	if err != nil {
-		return 0, err
+	return readFTPLine(bufio.NewReader(conn))
+}
+
+func readFTPLine(reader *bufio.Reader) (int, error) {
+	for {
+		rawResponse, err := reader.ReadString('\n')
+		if err != nil {
+			return 0, err
+		}
+		response := strings.TrimRight(rawResponse, "\r\n")
+		if len(response) < 3 {
+			return 0, fmt.Errorf("Error parsing ftp protocol: Status code too short: '%s'", rawResponse)
+		}
+		status, err := strconv.Atoi(response[:3])
+		if err != nil {
+			return 0, err
+		}
+		if len(response) == 3 {
+			return status, nil
+		}
+		// A hyphen after the status code starts a multi-line response. Keep
+		// reading until the final line whose status code is followed by a
+		// space.
+		if response[3] == '-' {
+			continue
+		}
+		return status, nil
 	}
-	if len(response) <= 3 {
-		return 0, fmt.Errorf("Error parsing ftp protocol: Status code too short: '%s'", response)
-	}
-	return strconv.Atoi(response[:3])
 }

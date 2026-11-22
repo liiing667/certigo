@@ -20,47 +20,62 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"strings"
 )
 
 func dumpTLSConnStateFromIMAP(dialer Dialer, address string, config *tls.Config) (*tls.ConnectionState, error) {
 	c, err := dialer.Dial("tcp", address)
 	if err != nil {
-		return nil, err
+		return nil, &ConnectError{Stage: stageForDialError(err), Err: err}
 	}
+	defer func() { _ = c.Close() }()
 
-	conn := c.(*net.TCPConn)
-	status, err := readIMAP(conn)
+	reader := bufio.NewReader(c)
+	status, err := readIMAPLine(reader)
 	if err != nil {
-		return nil, err
+		return nil, &ConnectError{Stage: stageStartTLS, Err: err}
 	}
-	if status != "OK" {
-		return nil, fmt.Errorf("IMAP server responded with %s, was expecting OK", status)
+	if !strings.EqualFold(status, "OK") {
+		return nil, &ConnectError{Stage: stageStartTLS, Err: fmt.Errorf("IMAP server responded with %s, was expecting OK", status)}
 	}
 
-	fmt.Fprintf(conn, "1 STARTTLS\r\n")
-	status, err = readIMAP(conn)
+	if _, err := fmt.Fprint(c, "1 STARTTLS\r\n"); err != nil {
+		return nil, &ConnectError{Stage: stageStartTLS, Err: err}
+	}
+	status, err = readIMAPLine(reader)
 	if err != nil {
-		return nil, err
+		return nil, &ConnectError{Stage: stageStartTLS, Err: err}
 	}
-	if status != "OK" {
-		return nil, fmt.Errorf("IMAP server responded with %s, was expecting OK", status)
+	if !strings.EqualFold(status, "OK") {
+		return nil, &ConnectError{Stage: stageStartTLS, Err: fmt.Errorf("IMAP server responded with %s, was expecting OK", status)}
 	}
 
-	tlsConn := tls.Client(conn, config)
+	tlsConn := tls.Client(c, config)
 	err = tlsConn.Handshake()
 	if err != nil {
-		return nil, err
+		return nil, &ConnectError{Stage: stageForNetworkError(err, stageTLSHandshake), Err: err}
 	}
 
 	state := tlsConn.ConnectionState()
 	return &state, nil
 }
 
+// readIMAP retains the historical helper signature for callers that pass a
+// single TCP connection.
+//nolint:unused // Retained for compatibility with package-level callers.
 func readIMAP(conn *net.TCPConn) (string, error) {
-	reader := bufio.NewReader(conn)
+	return readIMAPLine(bufio.NewReader(conn))
+}
+
+func readIMAPLine(reader *bufio.Reader) (string, error) {
 	response, err := reader.ReadString('\n')
 	if err != nil {
 		return "", err
 	}
-	return response[2:4], nil
+	response = strings.TrimRight(response, "\r\n")
+	fields := strings.Fields(response)
+	if len(fields) < 2 {
+		return "", fmt.Errorf("IMAP server response %q did not contain a status", response)
+	}
+	return strings.ToUpper(fields[1]), nil
 }

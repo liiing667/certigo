@@ -38,17 +38,35 @@ type simpleVerifyCert struct {
 }
 
 type SimpleVerification struct {
-	Error          string               `json:"error,omitempty"`
-	OCSPStatus     *ocsp.Response       `json:"ocsp_response,omitempty"`
-	OCSPWasStapled bool                 `json:"ocsp_was_stapled,omitempty"`
-	OCSPError      string               `json:"ocsp_error,omitempty"`
-	Chains         [][]simpleVerifyCert `json:"chains"`
+	Error                string               `json:"error,omitempty"`
+	OCSPStatus           *ocsp.Response       `json:"ocsp_response,omitempty"`
+	OCSPWasStapled       bool                 `json:"ocsp_was_stapled,omitempty"`
+	OCSPError            string               `json:"ocsp_error,omitempty"`
+	ConnectionAttempts   int                  `json:"connection_attempts,omitempty"`
+	ConnectionGeneration uint64               `json:"connection_generation,omitempty"`
+	Target               string               `json:"target,omitempty"`
+	FailureStage         string               `json:"failure_stage,omitempty"`
+	Chains               [][]simpleVerifyCert `json:"chains"`
+}
+
+// ConnectionReport describes the connection generation whose certificate
+// chain and verification result are being reported. Only one generation is
+// ever published, so a retry cannot attach a previous target name or
+// certificate request to a newer certificate chain.
+type ConnectionReport struct {
+	Attempts     int    `json:"attempts"`
+	Generation   uint64 `json:"generation"`
+	Target       string `json:"target"`
+	Host         string `json:"host,omitempty"`
+	Protocol     string `json:"protocol,omitempty"`
+	FailureStage string `json:"failure_stage,omitempty"`
 }
 
 type SimpleResult struct {
 	Certificates           []*x509.Certificate `json:"certificates"`
 	Formats                []string
 	VerifyResult           *SimpleVerification `json:"verify_result,omitempty"`
+	Connection             *ConnectionReport   `json:"connection,omitempty"`
 	TLSConnectionState     *tls.ConnectionState
 	CertificateRequestInfo *tls.CertificateRequestInfo
 }
@@ -64,6 +82,9 @@ func (s SimpleResult) MarshalJSON() ([]byte, error) {
 	if s.VerifyResult != nil {
 		out["verify_result"] = s.VerifyResult
 	}
+	if s.Connection != nil {
+		out["connection"] = s.Connection
+	}
 	if s.TLSConnectionState != nil {
 		out["tls_connection"] = EncodeTLSToObject(s.TLSConnectionState)
 	}
@@ -75,6 +96,29 @@ func (s SimpleResult) MarshalJSON() ([]byte, error) {
 		out["certificate_request_info"] = encoded
 	}
 	return json.Marshal(out)
+}
+
+// PrintConnectionReport writes the connection generation details. It is only
+// called when the report carries retry or failure evidence, so normal TLS
+// output remains unchanged.
+func PrintConnectionReport(out io.Writer, report *ConnectionReport) {
+	if report == nil {
+		return
+	}
+	_, _ = fmt.Fprint(out, "** CONNECTION **\n")
+	_, _ = fmt.Fprintf(out, "Target: %s\n", report.Target)
+	if report.Host != "" && report.Host != report.Target {
+		_, _ = fmt.Fprintf(out, "Verified Host: %s\n", report.Host)
+	}
+	if report.Protocol != "" {
+		_, _ = fmt.Fprintf(out, "Protocol: %s\n", report.Protocol)
+	}
+	_, _ = fmt.Fprintf(out, "Generation: %d\n", report.Generation)
+	_, _ = fmt.Fprintf(out, "Attempts: %d\n", report.Attempts)
+	if report.FailureStage != "" {
+		_, _ = fmt.Fprintf(out, "Failure Stage: %s\n", report.FailureStage)
+	}
+	_, _ = fmt.Fprint(out, "\n")
 }
 
 func caBundle(caPath string) (*x509.CertPool, error) {
