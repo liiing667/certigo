@@ -131,9 +131,15 @@ Signed Certificate Timestamp:
 {{- if .LogURL}}
 	Log URL: {{.LogURL}}
 {{- end}}
+{{- if .LogUnknown}}
+	Log Identity: unknown (not present in known log list)
+{{- end}}
 	Log ID: {{wrapWith 48 "\n\t        " (.LogID | hexify)}}
 	Timestamp: {{.Timestamp | formatTime}}
 	Signature: {{.SignatureAlgorithm | highlightAlgorithm}}
+{{- end}}
+{{- if .SCTError}}
+SCT Parse Error: {{.SCTError | redify}}
 {{- end}}
 {{- if .Warnings}}
 Lints:
@@ -162,6 +168,8 @@ URI Names:
 {{- if .EmailAddresses}}
 Email Addresses:
 	{{wrapWith .Width "\n\t" (join ", " .EmailAddresses)}}{{end}}
+{{- if .SCTError}}
+SCT Parse Error: {{.SCTError | redify}}{{end}}
 {{- if .Warnings}}
 Lints:{{range .Warnings}}
 	{{. | redify}}{{end}}{{end}}`

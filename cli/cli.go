@@ -109,6 +109,10 @@ func Run(args []string, tty terminal.Terminal) int {
 	app.UsageTemplate(kingpin.LongHelpTemplate)
 
 	result := lib.SimpleResult{}
+	// Kingpin accumulates slice-valued arguments across Parse calls. Run may
+	// be invoked repeatedly in the same process (notably by tests), so reset
+	// the dump inputs to keep each invocation independent.
+	*dumpFiles = nil
 	command, err := app.Parse(args)
 	if err != nil {
 		return printErr("%s, try --help\n", err)

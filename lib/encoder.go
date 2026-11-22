@@ -205,7 +205,10 @@ type simpleCertificate struct {
 	AltIPAddresses        []net.IP            `json:"ip_addresses,omitempty"`
 	URINames              []string            `json:"uri_names,omitempty"`
 	EmailAddresses        []string            `json:"email_addresses,omitempty"`
+	// SCTList and SCTError belong to this certificate only. Output consumers
+	// must use these fields instead of a shared or last-parsed CT result.
 	SCTList               []*simpleSCT        `json:"sct_list,omitempty"`
+	SCTError              string              `json:"sct_error,omitempty"`
 	Warnings              []string            `json:"lints,omitempty"`
 	PEM                   string              `json:"pem,omitempty"`
 
@@ -217,6 +220,9 @@ type simpleSCT struct {
 	Version            uint64       `json:"version"`
 	LogOperator        string       `json:"log_operator,omitempty"`
 	LogURL             string       `json:"log_url,omitempty"`
+	// LogUnknown is set only when LogID is not present in the bundled log
+	// list. The raw LogID is still emitted so the SCT remains auditable.
+	LogUnknown         bool         `json:"log_unknown,omitempty"`
 	LogID              []byte       `json:"log_id"`
 	Timestamp          time.Time    `json:"timestamp"`
 	SignatureAlgorithm simpleSigAlg `json:"signature_algorithm"`
@@ -233,6 +239,7 @@ type simpleExtKeyUsage x509.ExtKeyUsage
 type simpleSigAlg x509.SignatureAlgorithm
 
 func createSimpleCertificate(name string, cert *x509.Certificate) simpleCertificate {
+	sctList, sctErr := parseCertificateSCTs(cert)
 	out := simpleCertificate{
 		Alias:              name,
 		SerialNumber:       cert.SerialNumber.String(),
@@ -254,8 +261,11 @@ func createSimpleCertificate(name string, cert *x509.Certificate) simpleCertific
 		AltDNSNames:           cert.DNSNames,
 		AltIPAddresses:        cert.IPAddresses,
 		EmailAddresses:        cert.EmailAddresses,
-		SCTList:               parseSCTList(cert),
+		SCTList:               sctList,
 		PEM:                   string(pem.EncodeToMemory(EncodeX509ToPEM(cert, nil))),
+	}
+	if sctErr != nil {
+		out.SCTError = sctErr.Error()
 	}
 
 	for _, uri := range cert.URIs {

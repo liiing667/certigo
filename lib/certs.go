@@ -176,12 +176,13 @@ func pemToX509(callback func(*x509.Certificate, string, error) error) func(*pem.
 			return callback(cert, format, err)
 		case "PKCS7":
 			certs, err := pkcs7.ExtractCertificates(block.Bytes)
-			if err == nil {
-				for _, cert := range certs {
-					return callback(cert, format, nil)
-				}
-			} else {
+			if err != nil {
 				return callback(nil, format, err)
+			}
+			for _, cert := range certs {
+				if err := callback(cert, format, nil); err != nil {
+					return err
+				}
 			}
 		case "CERTIFICATE REQUEST":
 			fmt.Println(red.SprintfFunc()("warning: certificate requests are not supported"))
